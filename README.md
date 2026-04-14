@@ -151,6 +151,7 @@ Right-click any message → **Add to GitHub Issue**. Pick the repo and issue num
 | `DEFAULT_GITHUB_PROJECT` | optional | Project name to pre-select for all users (must match the project title exactly) |
 | `REPO_DEFAULT_LABELS` | optional | JSON map of repo → label names to pre-select on the issue card. E.g. `{"my-repo":["bug","triage"]}`. Overrides per-user saved defaults. |
 | `DYNAMODB_TABLE` | optional | DynamoDB table name for persistent thread→issue mapping. Without it, mappings are in-memory only (lost on restart). Table must have a String PK named `threadTs` with no sort key. Recommended for Lambda deployments. |
+| `GITHUB_BUTLER_SECRET_ID` | Lambda + Secrets Manager | AWS Secrets Manager secret ID containing all other env vars as a JSON object. When set, the app fetches secrets at cold-start via the [Parameters & Secrets Lambda extension](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets_lambda.html) instead of reading them from environment variables. |
 
 ---
 
@@ -224,14 +225,105 @@ Costs roughly ~$3-4/month (0.25 vCPU / 512 MB task). The subnets must be private
 
 No persistent process — effectively free at this usage level (~$0.25/month for a typical Slack bot, vs ~$15-20/month for Fargate).
 
-1. Bundle the app (e.g. with `esbuild` or a zip with `node_modules`)
-2. Create a Lambda function (Node.js 20+, handler: `app.handler`)
-3. Enable a **Function URL** (auth type: `NONE` — Slack verifies requests via signing secret)
-4. Set env vars: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `GITHUB_OWNER`
-5. Optionally set `DYNAMODB_TABLE` for persistent thread→issue mappings (create a table with String PK `threadTs`)
-6. In your Slack app settings, go to **Interactivity & Shortcuts → Request URL** and enter the Function URL
+#### 1. Package the zip
 
-> Do not set `SLACK_APP_TOKEN` — its absence is what switches the app into HTTP mode.
+```bash
+chmod +x package-lambda.sh
+./package-lambda.sh            # produces github_butler.zip
+# or specify a custom output path:
+./package-lambda.sh dist/github_butler.zip
+```
+
+This installs production-only dependencies and zips `app.js`, `src/`, and `node_modules/`.
+
+#### 2. Create the Lambda function
+
+- **Runtime:** Node.js 22.x (or 20.x)
+- **Handler:** `app.handler`
+- **Architecture:** x86_64 or arm64
+- **Memory:** 256 MB is sufficient; timeout 29 s (Slack's ack window)
+
+#### 3. Upload the zip
+
+**AWS CLI (one-off or CI):**
+
+```bash
+aws lambda update-function-code \
+  --function-name <your-function-name> \
+  --zip-file fileb://github_butler.zip \
+  --region us-east-1
+```
+
+**Terraform:**
+
+```hcl
+resource "aws_lambda_function" "github_butler" {
+  function_name    = "github-butler"
+  filename         = "github_butler.zip"
+  source_code_hash = filebase64sha256("github_butler.zip")
+  handler          = "app.handler"
+  runtime          = "nodejs22.x"
+  role             = aws_iam_role.lambda_exec.arn
+
+  environment {
+    variables = {
+      GITHUB_BUTLER_SECRET_ID = aws_secretsmanager_secret.bot.name
+    }
+  }
+}
+```
+
+> `source_code_hash` tells Terraform to re-deploy whenever the zip changes.
+
+#### 4. Enable a Function URL
+
+In the Lambda console → **Configuration → Function URL → Create** — set auth type to `NONE` (Slack verifies requests via the signing secret).
+
+#### 5. Set environment variables
+
+**Option A — plain env vars** (simplest):
+
+```
+SLACK_BOT_TOKEN       = xoxb-…
+SLACK_SIGNING_SECRET  = …
+GITHUB_TOKEN          = ghp_…
+GITHUB_OWNER          = your-org
+```
+
+Do **not** set `SLACK_APP_TOKEN` — its absence is what enables HTTP mode.
+
+**Option B — AWS Secrets Manager** (recommended for Terraform):
+
+Store all secrets in a single Secrets Manager secret as a JSON object:
+
+```json
+{
+  "SLACK_BOT_TOKEN": "xoxb-…",
+  "SLACK_SIGNING_SECRET": "…",
+  "GITHUB_TOKEN": "ghp_…",
+  "GITHUB_OWNER": "your-org"
+}
+```
+
+Then set only one env var on the function:
+
+```
+GITHUB_BUTLER_SECRET_ID = <secret-name-or-arn>
+```
+
+The app fetches and injects secrets at cold-start via the [Parameters & Secrets Lambda extension](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets_lambda.html). Add the extension as a Lambda layer and grant `secretsmanager:GetSecretValue` to the function's execution role.
+
+#### 6. (Optional) DynamoDB for thread→issue mapping
+
+Without a DynamoDB table, mappings are in-memory and lost on each cold start. For persistent mappings:
+
+1. Create a DynamoDB table with a String partition key named `threadTs` (no sort key)
+2. Set `DYNAMODB_TABLE=<table-name>` on the function
+3. Grant the execution role `dynamodb:GetItem`, `dynamodb:PutItem`, and `dynamodb:UpdateItem` on the table
+
+#### 7. Wire up Slack
+
+In your Slack app settings → **Interactivity & Shortcuts → Request URL** → paste the Function URL.
 
 #### Testing Lambda mode locally
 

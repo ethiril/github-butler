@@ -98,23 +98,16 @@ export function createGitHubHelpers(octokit, githubOwner) {
         }
       }
     }`;
-    try {
-      const response = await octokit.graphql(orgQuery, { owner: githubOwner });
-      return response.organization.projectsV2.nodes.map((project) => ({
-        text: project.title,
-        value: project.id,
-      }));
-    } catch {
-      try {
-        const response = await octokit.graphql(userQuery, { owner: githubOwner });
-        return response.user.projectsV2.nodes.map((project) => ({
-          text: project.title,
-          value: project.id,
-        }));
-      } catch {
-        return [];
-      }
+
+    const toProjectOption = (project) => ({ text: project.title, value: project.id });
+
+    const orgResult = await octokit.graphql(orgQuery, { owner: githubOwner }).catch(() => null);
+    if (orgResult) {
+      return orgResult.organization.projectsV2.nodes.map(toProjectOption);
     }
+
+    const userResult = await octokit.graphql(userQuery, { owner: githubOwner }).catch(() => null);
+    return (userResult?.user?.projectsV2?.nodes ?? []).map(toProjectOption);
   }
 
   async function getProjectFields(projectId) {
@@ -297,22 +290,6 @@ export function createGitHubHelpers(octokit, githubOwner) {
     return data;
   }
 
-  // Downloads an image from Slack (caller provides the buffer) and uploads it
-  // to .github/attachments/ in the repo so it has a stable public URL that
-  // GitHub's issue renderer can display inline.
-  async function uploadAttachment(repo, filename, buffer) {
-    const safeName = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-    const path = `.github/attachments/${safeName}`;
-    const { data } = await octokit.rest.repos.createOrUpdateFileContents({
-      owner: githubOwner,
-      repo,
-      path,
-      message: `Add issue attachment: ${filename}`,
-      content: buffer.toString("base64"),
-    });
-    return data.content.download_url;
-  }
-
   return {
     getRepos,
     getLabels,
@@ -328,6 +305,5 @@ export function createGitHubHelpers(octokit, githubOwner) {
     getIssue,
     searchIssues,
     addIssueComment,
-    uploadAttachment,
   };
 }

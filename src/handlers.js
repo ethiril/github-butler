@@ -10,35 +10,6 @@ import { fetchThreadMessages, compileThreadWithMeta, deriveTitle } from "./threa
 import { buildIssueCard, buildCardMeta } from "./card.js";
 import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs } from "./thread-store.js";
 
-// Downloads each image file from Slack (using the bot token) and uploads it to
-// the GitHub repo so it has a stable URL that renders inline in issue markdown.
-// Results are cached by Slack file ID — each file is only uploaded once per
-// issue creation flow even if the same image appears in multiple messages.
-function makeImageUploader(github, repo) {
-  const cache = new Map();
-  return (file) => {
-    if (!cache.has(file.id)) {
-      cache.set(file.id, (async () => {
-        const response = await fetch(file.url_private, {
-          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        });
-        if (!response.ok) return null;
-        const contentType = response.headers.get("content-type") ?? "";
-        if (contentType.includes("text/html")) {
-          console.warn("[handlers] Slack returned HTML for file download — bot token may be missing files:read scope");
-          return null;
-        }
-        const buffer = Buffer.from(await response.arrayBuffer());
-        return github.uploadAttachment(repo, file.name ?? file.id, buffer);
-      })().catch((err) => {
-        console.warn(`[handlers] image upload failed for ${file.name ?? file.id}:`, err.message);
-        return null;
-      }));
-    }
-    return cache.get(file.id);
-  };
-}
-
 // GitHub repo names: alphanumeric, hyphen, underscore, dot; cannot start with
 // dot or hyphen; max 100 chars. Validated before making any API call with a
 // user-supplied repo name (e.g., from emoji suffix routing).
@@ -47,9 +18,49 @@ function isValidRepoName(name) {
   return typeof name === "string" && VALID_REPO_RE.test(name);
 }
 
-// Return only the message from an error — never expose stack traces or tokens.
-function safeErrMsg(err) {
+function safeErrorMessage(err) {
   return err?.message ?? "An unexpected error occurred.";
+}
+
+async function appendThreadUpdateToIssue(client, github, { channelId, threadTs, userId, existingIssue }) {
+  const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
+  const allMessages = await fetchThreadMessages(client, channelId, threadTs);
+  const newContent = await compileThreadWithMeta(client, allMessages, { sinceTs: lastSyncedTs });
+
+  if (!newContent) {
+    await client.chat.postEphemeral({
+      channel: channelId,
+      user: userId,
+      thread_ts: threadTs,
+      text: `No new messages to add to ${issueRepo}#${issueNumber} since last sync.`,
+    });
+    return;
+  }
+
+  const latestTs = allMessages[allMessages.length - 1]?.ts ?? lastSyncedTs;
+
+  try {
+    const comment = await github.addIssueComment(
+      issueRepo,
+      issueNumber,
+      `${newContent}\n\n---\n_Updated from Slack_`
+    );
+    await updateThreadIssueSyncTs(threadTs, latestTs);
+    await client.chat.postMessage({
+      channel: channelId,
+      thread_ts: threadTs,
+      unfurl_links: false,
+      text: `Thread update added to <${comment.html_url}|${issueRepo}#${issueNumber}>`,
+    });
+  } catch (err) {
+    console.error("[handlers] tag update failed:", err);
+    await client.chat.postEphemeral({
+      channel: channelId,
+      user: userId,
+      thread_ts: threadTs,
+      text: `Failed to update issue: ${safeErrorMessage(err)}`,
+    });
+  }
 }
 
 function collectModalProjectFieldValues(stateValues = {}) {
@@ -356,47 +367,12 @@ export function registerHandlers(app, github) {
       // Tag update: check for an existing thread → issue mapping
       const existingIssue = await getThreadIssue(threadTs);
       if (existingIssue) {
-        const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
-        const allMessages = await fetchThreadMessages(client, event.channel, threadTs);
-        const newContent = await compileThreadWithMeta(client, allMessages, {
-          sinceTs: lastSyncedTs,
-          imageUploader: makeImageUploader(github, issueRepo),
+        await appendThreadUpdateToIssue(client, github, {
+          channelId: event.channel,
+          threadTs,
+          userId,
+          existingIssue,
         });
-
-        if (!newContent) {
-          await client.chat.postEphemeral({
-            channel: event.channel,
-            user: userId,
-            thread_ts: threadTs,
-            text: `No new messages to add to ${issueRepo}#${issueNumber} since last sync.`,
-          });
-          return;
-        }
-
-        const latestTs = allMessages[allMessages.length - 1]?.ts ?? lastSyncedTs;
-
-        try {
-          const comment = await github.addIssueComment(
-            issueRepo,
-            issueNumber,
-            `${newContent}\n\n---\n_Updated from Slack_`
-          );
-          await updateThreadIssueSyncTs(threadTs, latestTs);
-          await client.chat.postMessage({
-            channel: event.channel,
-            thread_ts: threadTs,
-            unfurl_links: false,
-            text: `Thread update added to <${comment.html_url}|${issueRepo}#${issueNumber}>`,
-          });
-        } catch (err) {
-          console.error("Caret tag update failed:", err);
-          await client.chat.postEphemeral({
-            channel: event.channel,
-            user: userId,
-            thread_ts: threadTs,
-            text: `Failed to update issue: ${safeErrMsg(err)}`,
-          });
-        }
         return;
       }
 
@@ -462,7 +438,7 @@ export function registerHandlers(app, github) {
           channel: event.channel,
           user: userId,
           thread_ts: threadTs,
-          text: `Failed to create issue card: ${safeErrMsg(err)}`,
+          text: `Failed to create issue card: ${safeErrorMessage(err)}`,
         });
       });
       return;
@@ -561,7 +537,7 @@ export function registerHandlers(app, github) {
         channel: slackMessageContext.channelId,
         user: userId,
         ...(slackMessageContext.threadTs ? { thread_ts: slackMessageContext.threadTs } : {}),
-        text: `Failed to create issue card: ${safeErrMsg(err)}`,
+        text: `Failed to create issue card: ${safeErrorMessage(err)}`,
       });
     });
   });
@@ -625,47 +601,7 @@ export function registerHandlers(app, github) {
     // Check for an existing thread → issue mapping (tag update flow)
     const existingIssue = await getThreadIssue(threadTs);
     if (existingIssue) {
-      const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
-      const allMessages = await fetchThreadMessages(client, channelId, threadTs);
-      const newContent = await compileThreadWithMeta(client, allMessages, {
-        sinceTs: lastSyncedTs,
-        imageUploader: makeImageUploader(github, issueRepo),
-      });
-
-      if (!newContent) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          thread_ts: threadTs,
-          text: `No new messages to add to ${issueRepo}#${issueNumber} since last sync.`,
-        });
-        return;
-      }
-
-      const latestTs = allMessages[allMessages.length - 1]?.ts ?? lastSyncedTs;
-
-      try {
-        const comment = await github.addIssueComment(
-          issueRepo,
-          issueNumber,
-          `${newContent}\n\n---\n_Updated from Slack_`
-        );
-        await updateThreadIssueSyncTs(threadTs, latestTs);
-        await client.chat.postMessage({
-          channel: channelId,
-          thread_ts: threadTs,
-          unfurl_links: false,
-          text: `Thread update added to <${comment.html_url}|${issueRepo}#${issueNumber}>`,
-        });
-      } catch (err) {
-        console.error("Tag update failed:", err);
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          thread_ts: threadTs,
-          text: `Failed to update issue: ${safeErrMsg(err)}`,
-        });
-      }
+      await appendThreadUpdateToIssue(client, github, { channelId, threadTs, userId, existingIssue });
       return;
     }
 
@@ -700,7 +636,7 @@ export function registerHandlers(app, github) {
         channel: channelId,
         user: userId,
         thread_ts: threadTs,
-        text: `Failed to create issue card: ${safeErrMsg(err)}`,
+        text: `Failed to create issue card: ${safeErrorMessage(err)}`,
       });
     });
   });
@@ -947,9 +883,7 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-        imageUploader: makeImageUploader(github, selectedRepo),
-      });
+      const threadContent = await compileThreadWithMeta(client, threadMsgs);
       if (threadContent) {
         issueBody = issueBody ? `${issueBody}\n\n${threadContent}` : threadContent;
       }
@@ -1009,7 +943,7 @@ export function registerHandlers(app, github) {
       console.error("Failed to create issue:", err);
       await client.chat.postMessage({
         channel: slackMessageContext.userId,
-        text: `Failed to create GitHub issue in *${selectedRepo}*: ${safeErrMsg(err)}`,
+        text: `Failed to create GitHub issue in *${selectedRepo}*: ${safeErrorMessage(err)}`,
       });
     }
   });
@@ -1052,9 +986,7 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-        imageUploader: makeImageUploader(github, selectedRepo),
-      });
+      const threadContent = await compileThreadWithMeta(client, threadMsgs);
       if (threadContent) {
         commentBody = commentBody ? `${commentBody}\n\n${threadContent}` : threadContent;
       }
@@ -1074,7 +1006,7 @@ export function registerHandlers(app, github) {
       console.error("Failed to add comment:", err);
       await client.chat.postMessage({
         channel: slackMessageContext.userId,
-        text: `Failed to add comment to *${selectedRepo}#${issueNumber}*: ${safeErrMsg(err)}`,
+        text: `Failed to add comment to *${selectedRepo}#${issueNumber}*: ${safeErrorMessage(err)}`,
       });
     }
   });
@@ -1117,9 +1049,7 @@ export function registerHandlers(app, github) {
     if (cardMeta.threadTs) {
       const threadMsgs = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs);
       if (threadMsgs.length > 1) {
-        const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-          imageUploader: makeImageUploader(github, cardMeta.repo),
-        });
+        const threadContent = await compileThreadWithMeta(client, threadMsgs);
         if (threadContent) issueBody = threadContent;
       }
     }
@@ -1198,7 +1128,7 @@ export function registerHandlers(app, github) {
       console.error("Card issue creation failed:", err);
       await respond({
         replace_original: true,
-        text: `Failed to create issue: ${safeErrMsg(err)}`,
+        text: `Failed to create issue: ${safeErrorMessage(err)}`,
       });
     }
   });
