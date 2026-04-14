@@ -60,6 +60,7 @@ export function buildIssueCard({
   milestones = [],
   priorityField = null,
   statusField = null,
+  typeField = null,
   defaultLabelValues = [],
   defaultMilestoneValue = null,
   cardMeta,
@@ -80,6 +81,25 @@ export function buildIssueCard({
       },
     },
   ];
+
+  const safeTypeOptions = takeOptions(typeField?.options);
+
+  if (safeTypeOptions.length > 0) {
+    blocks.push({
+      type: "section",
+      block_id: "card_type",
+      text: {
+        type: "mrkdwn",
+        text: "*Type*",
+      },
+      accessory: {
+        type: "static_select",
+        action_id: "card_type_select",
+        placeholder: { type: "plain_text", text: "Type" },
+        options: safeTypeOptions.map((o) => toSlackOption(o.name, o.id)),
+      },
+    });
+  }
 
   if (safePriorityOptions.length > 0) {
     const defaultOpt =
@@ -219,6 +239,7 @@ export function buildCardMeta({
   projectId = null,
   priorityField = null,
   statusField = null,
+  typeField = null,
   defaultLabelValues = [],
   defaultMilestoneValue = null,
 }) {
@@ -241,6 +262,8 @@ export function buildCardMeta({
       statusField?.options?.find((o) => /backlog/i.test(o.name))?.id ??
       statusField?.options?.[0]?.id ??
       null,
+    typeFieldId: typeField?.id ?? null,
+    defaultTypeOptionId: null,
     defaultLabelValues,
     defaultMilestoneValue,
   };

@@ -64,7 +64,7 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
 
   const priorityField = projectFields.find((f) => /priority/i.test(f.name)) ?? null;
   const statusField = projectFields.find((f) => /status/i.test(f.name)) ?? null;
-  const title = deriveTitle(messageText);
+  const typeField = projectFields.find((f) => /^type$/i.test(f.name)) ?? null;
 
   const cardMeta = buildCardMeta({
     repo,
@@ -77,6 +77,7 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     projectId,
     priorityField,
     statusField,
+    typeField,
     defaultLabelValues: defaults.labelValues ?? [],
     defaultMilestoneValue: defaults.milestoneValue ?? null,
   });
@@ -88,6 +89,7 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     milestones,
     priorityField,
     statusField,
+    typeField,
     defaultLabelValues: defaults.labelValues ?? [],
     defaultMilestoneValue: defaults.milestoneValue ?? null,
     cardMeta,
@@ -882,6 +884,11 @@ export function registerHandlers(app, github) {
     // elements the user did not interact with (Slack only tracks changed state
     // in actions blocks, unlike modal input blocks).
     // Dropdown values are GitHub option IDs — use them directly as singleSelectOptionId.
+    const typeOptionId =
+      stateValues.card_type?.card_type_select?.selected_option?.value ??
+      stateValues.card_selections?.card_type_select?.selected_option?.value ??
+      cardMeta.defaultTypeOptionId;
+
     const priorityOptionId =
       stateValues.card_priority?.card_priority_select?.selected_option?.value ??
       stateValues.card_selections?.card_priority_select?.selected_option?.value ??
@@ -941,6 +948,17 @@ export function registerHandlers(app, github) {
               ).catch((err) => console.error("Failed to set priority:", err.message))
             );
           }
+          if (cardMeta.typeFieldId && typeOptionId) {
+            fieldUpdates.push(
+              github.setProjectField(
+                cardMeta.projectId,
+                projectItemId,
+                cardMeta.typeFieldId,
+                { singleSelectOptionId: typeOptionId }
+              ).catch((err) => console.error("Failed to set type:", err.message))
+            );
+          }
+
           if (cardMeta.statusFieldId && statusOptionId) {
             fieldUpdates.push(
               github.setProjectField(

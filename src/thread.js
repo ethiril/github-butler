@@ -28,6 +28,18 @@ function formatTs(ts) {
   return `${months[d.getMonth()]} ${d.getDate()} at ${h12}:${String(d.getMinutes()).padStart(2, "0")} ${ampm}`;
 }
 
+function inlineDisplayName(msg) {
+  return (
+    msg?.user_profile?.display_name ||
+    msg?.user_profile?.real_name ||
+    msg?.profile?.display_name ||
+    msg?.profile?.real_name ||
+    msg?.bot_profile?.name ||
+    msg?.username ||
+    null
+  );
+}
+
 // Async version of compileThread that enriches each message with the author's
 // display name and a formatted timestamp. Pass sinceTs (a Slack ts string) to
 // include only messages newer than that timestamp — used for incremental thread
@@ -42,9 +54,15 @@ export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) 
   // Cache the Promise itself so concurrent lookups for the same user share
   // a single in-flight API call rather than firing one each.
   const userCache = new Map();
-  function resolveDisplayName(userId) {
+
+  function resolveDisplayName(msg) {
+    const inlineName = inlineDisplayName(msg);
+    if (inlineName) return Promise.resolve(inlineName);
+
+    const userId = msg?.user;
     if (!userId) return Promise.resolve("Unknown");
     if (userCache.has(userId)) return userCache.get(userId);
+
     const promise = client.users.info({ user: userId })
       .then((result) =>
         result?.user?.profile?.display_name ||
@@ -53,6 +71,7 @@ export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) 
         userId
       )
       .catch(() => userId);
+
     userCache.set(userId, promise);
     return promise;
   }
@@ -61,10 +80,12 @@ export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) 
     filtered.map(async (msg) => {
       const text = (msg.text ?? "").trim();
       if (!text) return null;
-      const author = await resolveDisplayName(msg.user);
+
+      const author = await resolveDisplayName(msg);
       const timestamp = formatTs(msg.ts);
       const quotedText = text.replace(/\n/g, "\n> ");
-      return `**@${author}** · ${timestamp}\n> ${quotedText}`;
+
+      return `**${author}** · ${timestamp}\n> ${quotedText}`;
     })
   );
 
