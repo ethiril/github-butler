@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { toSlackOption, resolveDefaultProjectId, buildProjectFieldMap, buildModal } from "../src/modal.js";
+import { toSlackOption, resolveDefaultProjectId, buildProjectFieldMap, buildModal, buildAddToIssueModal } from "../src/modal.js";
 
 // ── toSlackOption ─────────────────────────────────────────────────────────────
 
@@ -224,5 +224,66 @@ describe("buildModal", () => {
     const metadata = { channelId: "C123", userId: "U456", projectFieldMap: {} };
     const modal = buildModal({ metadata });
     assert.deepEqual(JSON.parse(modal.private_metadata), metadata);
+  });
+
+  test("thread_block appears when metadata has threadTs", () => {
+    const modal = buildModal({ metadata: { threadTs: "123.456" } });
+    assert.ok(modal.blocks.some((b) => b.block_id === "thread_block"));
+  });
+
+  test("thread_block is absent when metadata has no threadTs", () => {
+    const modal = buildModal({ metadata: {} });
+    assert.ok(!modal.blocks.some((b) => b.block_id === "thread_block"));
+  });
+
+  test("thread_block comes after body_block", () => {
+    const modal = buildModal({ metadata: { threadTs: "123.456" } });
+    const ids = modal.blocks.map((b) => b.block_id);
+    assert.ok(ids.indexOf("body_block") < ids.indexOf("thread_block"));
+  });
+});
+
+// ── buildAddToIssueModal ──────────────────────────────────────────────────────
+
+describe("buildAddToIssueModal", () => {
+  test("has callback_id add_to_issue_modal", () => {
+    const modal = buildAddToIssueModal({ metadata: {} });
+    assert.equal(modal.callback_id, "add_to_issue_modal");
+  });
+
+  test("contains repo, issue number, and body blocks", () => {
+    const modal = buildAddToIssueModal({ metadata: {} });
+    const ids = modal.blocks.map((b) => b.block_id);
+    assert.ok(ids.includes("repo_block"));
+    assert.ok(ids.includes("issue_number_block"));
+    assert.ok(ids.includes("body_block"));
+  });
+
+  test("pre-fills body with messageText", () => {
+    const modal = buildAddToIssueModal({ messageText: "bug found here", metadata: {} });
+    const bodyBlock = modal.blocks.find((b) => b.block_id === "body_block");
+    assert.equal(bodyBlock.element.initial_value, "bug found here");
+  });
+
+  test("currentBody takes precedence over messageText", () => {
+    const modal = buildAddToIssueModal({ messageText: "original", currentBody: "edited", metadata: {} });
+    const bodyBlock = modal.blocks.find((b) => b.block_id === "body_block");
+    assert.equal(bodyBlock.element.initial_value, "edited");
+  });
+
+  test("thread_block appears when metadata has threadTs", () => {
+    const modal = buildAddToIssueModal({ metadata: { threadTs: "123.456" } });
+    assert.ok(modal.blocks.some((b) => b.block_id === "thread_block"));
+  });
+
+  test("thread_block is absent when no threadTs", () => {
+    const modal = buildAddToIssueModal({ metadata: {} });
+    assert.ok(!modal.blocks.some((b) => b.block_id === "thread_block"));
+  });
+
+  test("repo_block uses repo_select action_id for shared options handler", () => {
+    const modal = buildAddToIssueModal({ metadata: {} });
+    const repoBlock = modal.blocks.find((b) => b.block_id === "repo_block");
+    assert.equal(repoBlock.element.action_id, "repo_select");
   });
 });

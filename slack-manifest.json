@@ -8,7 +8,7 @@
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,
     "event_subscriptions": {
-      "bot_events": ["app_mention"]
+      "bot_events": ["app_mention", "reaction_added"]
     },
     "interactivity": {
       "is_enabled": true
@@ -26,13 +26,19 @@
         "type": "message",
         "callback_id": "create_github_issue",
         "description": "File a GitHub issue from this message"
+      },
+      {
+        "name": "Add to GitHub Issue",
+        "type": "message",
+        "callback_id": "add_to_github_issue",
+        "description": "Add this message as a comment on an existing GitHub issue"
       }
     ],
     "slash_commands": [
       {
         "command": "/issue",
-        "description": "Create a GitHub issue",
-        "usage_hint": "[title]",
+        "description": "Create or look up a GitHub issue",
+        "usage_hint": "[title | <num> | repo#<num> | search <query>]",
         "should_escape": false
       }
     ]
@@ -46,7 +52,8 @@
         "im:history",
         "mpim:history",
         "commands",
-        "app_mentions:read"
+        "app_mentions:read",
+        "reactions:read"
       ]
     }
   }

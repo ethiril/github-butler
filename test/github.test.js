@@ -189,4 +189,59 @@ describe("createGitHubHelpers", () => {
     assert.equal(fields.length, 2);
     assert.deepEqual(fields.map((f) => f.name), ["Priority", "Status"]);
   });
+
+  test("getIssue returns issue data", async () => {
+    const mockOctokit = {
+      rest: {
+        issues: {
+          get: async ({ repo, issue_number }) => ({
+            data: { number: issue_number, title: "Test issue", state: "open", labels: [], assignees: [], html_url: "https://github.com/owner/repo/issues/1" },
+          }),
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    const issue = await github.getIssue("my-repo", 42);
+    assert.equal(issue.number, 42);
+    assert.equal(issue.title, "Test issue");
+  });
+
+  test("addIssueComment calls createComment with correct params", async () => {
+    let capturedParams;
+    const mockOctokit = {
+      rest: {
+        issues: {
+          createComment: async (params) => {
+            capturedParams = params;
+            return { data: { id: 1, html_url: "https://github.com/..." } };
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    await github.addIssueComment("my-repo", 99, "Great issue!");
+    assert.equal(capturedParams.owner, "test-owner");
+    assert.equal(capturedParams.repo, "my-repo");
+    assert.equal(capturedParams.issue_number, 99);
+    assert.equal(capturedParams.body, "Great issue!");
+  });
+
+  test("searchIssues scopes query to the configured owner", async () => {
+    let capturedQuery;
+    const mockOctokit = {
+      rest: {
+        search: {
+          issuesAndPullRequests: async ({ q }) => {
+            capturedQuery = q;
+            return { data: { items: [] } };
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "acme-corp");
+    await github.searchIssues("login bug");
+    assert.ok(capturedQuery.includes("user:acme-corp"));
+    assert.ok(capturedQuery.includes("login bug"));
+    assert.ok(capturedQuery.includes("is:issue"));
+  });
 });

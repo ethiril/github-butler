@@ -1,4 +1,6 @@
 // All functions in this module are pure — no I/O, no env reads, no side effects.
+// buildModal and buildAddToIssueModal both read metadata.threadTs to decide
+// whether to render the "Append full thread" checkbox.
 
 export function toSlackOption(displayText, value) {
   return {
@@ -99,6 +101,23 @@ export function buildModal({
       },
     }
   );
+
+  if (metadata?.threadTs) {
+    blocks.push({
+      type: "input",
+      block_id: "thread_block",
+      optional: true,
+      label: { type: "plain_text", text: "Thread" },
+      element: {
+        type: "checkboxes",
+        action_id: "include_thread",
+        options: [{
+          text: { type: "plain_text", text: "Append full thread to body" },
+          value: "include_thread",
+        }],
+      },
+    });
+  }
 
   if (!selectedRepo) {
     blocks.push({
@@ -216,6 +235,70 @@ export function buildModal({
     private_metadata: JSON.stringify(metadata),
     title: { type: "plain_text", text: "Create GitHub Issue" },
     submit: { type: "plain_text", text: "Create Issue" },
+    close: { type: "plain_text", text: "Cancel" },
+    blocks,
+  };
+}
+
+export function buildAddToIssueModal({ messageText = "", metadata, currentBody = "" }) {
+  const blocks = [
+    {
+      type: "input",
+      block_id: "repo_block",
+      label: { type: "plain_text", text: "Repository" },
+      element: {
+        type: "external_select",
+        action_id: "repo_select",
+        min_query_length: 0,
+        placeholder: { type: "plain_text", text: "Pick a repo…" },
+      },
+    },
+    {
+      type: "input",
+      block_id: "issue_number_block",
+      label: { type: "plain_text", text: "Issue Number" },
+      element: {
+        type: "plain_text_input",
+        action_id: "issue_number_input",
+        placeholder: { type: "plain_text", text: "e.g. 123" },
+      },
+    },
+    {
+      type: "input",
+      block_id: "body_block",
+      label: { type: "plain_text", text: "Comment" },
+      element: {
+        type: "plain_text_input",
+        action_id: "body_input",
+        multiline: true,
+        initial_value: currentBody || messageText,
+      },
+    },
+  ];
+
+  if (metadata?.threadTs) {
+    blocks.push({
+      type: "input",
+      block_id: "thread_block",
+      optional: true,
+      label: { type: "plain_text", text: "Thread" },
+      element: {
+        type: "checkboxes",
+        action_id: "include_thread",
+        options: [{
+          text: { type: "plain_text", text: "Append full thread to comment" },
+          value: "include_thread",
+        }],
+      },
+    });
+  }
+
+  return {
+    type: "modal",
+    callback_id: "add_to_issue_modal",
+    private_metadata: JSON.stringify(metadata),
+    title: { type: "plain_text", text: "Add to GitHub Issue" },
+    submit: { type: "plain_text", text: "Add Comment" },
     close: { type: "plain_text", text: "Cancel" },
     blocks,
   };
