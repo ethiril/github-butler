@@ -53,7 +53,8 @@
         "mpim:history",
         "commands",
         "app_mentions:read",
-        "reactions:read"
+        "reactions:read",
+        "files:read"
       ]
     }
   }

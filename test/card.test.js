@@ -54,20 +54,23 @@ describe("buildIssueCard", () => {
     assert.deepEqual(JSON.parse(createBtn.value), cardMeta);
   });
 
-  test("omits card_selections block when no fields or labels", () => {
+  test("omits priority, status, labels, and milestone blocks when none provided", () => {
     const blocks = buildIssueCard(minimalArgs);
-    assert.ok(!blocks.some((b) => b.block_id === "card_selections"));
+    assert.ok(!blocks.some((b) => b.block_id === "card_priority"));
+    assert.ok(!blocks.some((b) => b.block_id === "card_status"));
+    assert.ok(!blocks.some((b) => b.block_id === "card_labels"));
+    assert.ok(!blocks.some((b) => b.block_id === "card_milestone"));
   });
 
-  test("includes priority dropdown in card_selections when priorityField provided", () => {
+  test("includes priority dropdown in card_priority block when priorityField provided", () => {
     const priorityField = {
       id: "f1",
       options: [{ id: "o1", name: "High" }, { id: "o2", name: "Low" }],
     };
     const blocks = buildIssueCard({ ...minimalArgs, priorityField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    assert.ok(selections);
-    assert.ok(selections.elements.some((e) => e.action_id === "card_priority_select"));
+    const priorityBlock = blocks.find((b) => b.block_id === "card_priority");
+    assert.ok(priorityBlock);
+    assert.equal(priorityBlock.accessory.action_id, "card_priority_select");
   });
 
   test("defaults priority dropdown to High option (value is option ID)", () => {
@@ -76,22 +79,20 @@ describe("buildIssueCard", () => {
       options: [{ id: "o1", name: "Low" }, { id: "o2", name: "High" }, { id: "o3", name: "Medium" }],
     };
     const blocks = buildIssueCard({ ...minimalArgs, priorityField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const priorityEl = selections.elements.find((e) => e.action_id === "card_priority_select");
-    // value is the GitHub option ID, not the name
+    const priorityEl = blocks.find((b) => b.block_id === "card_priority").accessory;
     assert.equal(priorityEl.initial_option.value, "o2");
     assert.equal(priorityEl.initial_option.text.text, "High");
   });
 
-  test("includes status dropdown in card_selections when statusField provided", () => {
+  test("includes status dropdown in card_status block when statusField provided", () => {
     const statusField = {
       id: "f2",
       options: [{ id: "o1", name: "Backlog" }, { id: "o2", name: "In Progress" }],
     };
     const blocks = buildIssueCard({ ...minimalArgs, statusField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    assert.ok(selections);
-    assert.ok(selections.elements.some((e) => e.action_id === "card_status_select"));
+    const statusBlock = blocks.find((b) => b.block_id === "card_status");
+    assert.ok(statusBlock);
+    assert.equal(statusBlock.accessory.action_id, "card_status_select");
   });
 
   test("defaults status dropdown to Backlog option (value is option ID)", () => {
@@ -100,26 +101,23 @@ describe("buildIssueCard", () => {
       options: [{ id: "o1", name: "In Progress" }, { id: "o2", name: "Backlog" }],
     };
     const blocks = buildIssueCard({ ...minimalArgs, statusField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const statusEl = selections.elements.find((e) => e.action_id === "card_status_select");
-    // value is the GitHub option ID, not the name
+    const statusEl = blocks.find((b) => b.block_id === "card_status").accessory;
     assert.equal(statusEl.initial_option.value, "o2");
     assert.equal(statusEl.initial_option.text.text, "Backlog");
   });
 
-  test("includes labels multi-select when labels provided", () => {
+  test("includes labels multi-select in card_labels block when labels provided", () => {
     const labels = [{ text: "bug", value: "bug" }, { text: "feature", value: "feature" }];
     const blocks = buildIssueCard({ ...minimalArgs, labels });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    assert.ok(selections);
-    assert.ok(selections.elements.some((e) => e.action_id === "card_labels_select"));
+    const labelsBlock = blocks.find((b) => b.block_id === "card_labels");
+    assert.ok(labelsBlock);
+    assert.equal(labelsBlock.accessory.action_id, "card_labels_select");
   });
 
   test("pre-selects default labels", () => {
     const labels = [{ text: "bug", value: "bug" }, { text: "feature", value: "feature" }];
     const blocks = buildIssueCard({ ...minimalArgs, labels, defaultLabelValues: ["bug"] });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const labelsEl = selections.elements.find((e) => e.action_id === "card_labels_select");
+    const labelsEl = blocks.find((b) => b.block_id === "card_labels").accessory;
     assert.equal(labelsEl.initial_options.length, 1);
     assert.equal(labelsEl.initial_options[0].value, "bug");
   });
@@ -133,8 +131,7 @@ describe("buildIssueCard", () => {
   test("milestone dropdown includes No milestone option", () => {
     const milestones = [{ text: "v1.0", value: "1" }];
     const blocks = buildIssueCard({ ...minimalArgs, milestones });
-    const milestoneBlock = blocks.find((b) => b.block_id === "card_milestone");
-    const milestoneEl = milestoneBlock.elements[0];
+    const milestoneEl = blocks.find((b) => b.block_id === "card_milestone").accessory;
     assert.ok(milestoneEl.options.some((o) => o.value === "__none__"));
   });
 
@@ -149,8 +146,7 @@ describe("buildIssueCard", () => {
       value: `label-${i}`,
     }));
     const blocks = buildIssueCard({ ...minimalArgs, labels });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const labelsEl = selections.elements.find((e) => e.action_id === "card_labels_select");
+    const labelsEl = blocks.find((b) => b.block_id === "card_labels").accessory;
     assert.equal(labelsEl.options.length, 100);
   });
 
@@ -163,8 +159,7 @@ describe("buildIssueCard", () => {
       })),
     };
     const blocks = buildIssueCard({ ...minimalArgs, priorityField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const priorityEl = selections.elements.find((e) => e.action_id === "card_priority_select");
+    const priorityEl = blocks.find((b) => b.block_id === "card_priority").accessory;
     assert.equal(priorityEl.options.length, 100);
   });
 
@@ -177,8 +172,7 @@ describe("buildIssueCard", () => {
       })),
     };
     const blocks = buildIssueCard({ ...minimalArgs, statusField });
-    const selections = blocks.find((b) => b.block_id === "card_selections");
-    const statusEl = selections.elements.find((e) => e.action_id === "card_status_select");
+    const statusEl = blocks.find((b) => b.block_id === "card_status").accessory;
     assert.equal(statusEl.options.length, 100);
   });
 
@@ -188,8 +182,7 @@ describe("buildIssueCard", () => {
       value: `${i}`,
     }));
     const blocks = buildIssueCard({ ...minimalArgs, milestones });
-    const milestoneBlock = blocks.find((b) => b.block_id === "card_milestone");
-    const milestoneEl = milestoneBlock.elements[0];
+    const milestoneEl = blocks.find((b) => b.block_id === "card_milestone").accessory;
     assert.equal(milestoneEl.options.length, 100);
     assert.equal(milestoneEl.options[0].value, "__none__");
   });

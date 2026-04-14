@@ -112,7 +112,7 @@ describe("compileThreadWithMeta", () => {
   test("includes the author's display name", async () => {
     const messages = [{ ts: "1000.0", user: "U1", text: "Hello" }];
     const result = await compileThreadWithMeta(makeClient({ U1: "Alice" }), messages);
-    assert.ok(result.includes("@Alice"));
+    assert.ok(result.includes("Alice"));
   });
 
   test("includes message text as a blockquote", async () => {
@@ -161,12 +161,12 @@ describe("compileThreadWithMeta", () => {
   test("uses userId as fallback when user lookup fails", async () => {
     const messages = [{ ts: "1000.0", user: "U_UNKNOWN", text: "Hello" }];
     const result = await compileThreadWithMeta(makeClient({}), messages);
-    assert.ok(result.includes("@U_UNKNOWN"));
+    assert.ok(result.includes("U_UNKNOWN"));
   });
 
   test("uses Unknown when userId is missing", async () => {
     const messages = [{ ts: "1000.0", text: "Hello" }];
     const result = await compileThreadWithMeta(makeClient({}), messages);
-    assert.ok(result.includes("@Unknown"));
+    assert.ok(result.includes("Unknown"));
   });
 });

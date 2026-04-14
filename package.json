@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node app.js",
     "dev": "node --watch app.js",
+    "dev:lambda": "node --watch local-lambda.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
     "@octokit/rest": "^22.0.1",
     "@slack/bolt": "^4.1.0",
     "js-yaml": "^4.1.0"

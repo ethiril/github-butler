@@ -218,17 +218,6 @@ export function createGitHubHelpers(octokit, githubOwner) {
   }
 
   async function setProjectItemFields(projectId, itemId, projectFieldMap, formValues) {
-    const mutation = `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2FieldValue!) {
-      updateProjectV2ItemFieldValue(input: {
-        projectId: $projectId
-        itemId: $itemId
-        fieldId: $fieldId
-        value: $value
-      }) {
-        projectV2Item { id }
-      }
-    }`;
-
     await Promise.all(
       Object.entries(projectFieldMap).map(async ([blockId, field]) => {
         const elementValues = formValues[blockId]?.[`${blockId}_input`];
@@ -251,7 +240,7 @@ export function createGitHubHelpers(octokit, githubOwner) {
           return;
         }
 
-        await octokit.graphql(mutation, { projectId, itemId, fieldId: field.id, value: fieldValue })
+        await setProjectField(projectId, itemId, field.id, fieldValue)
           .catch((err) => console.error(`Failed to set project field ${field.id}:`, err.message));
       })
     );
@@ -308,6 +297,22 @@ export function createGitHubHelpers(octokit, githubOwner) {
     return data;
   }
 
+  // Downloads an image from Slack (caller provides the buffer) and uploads it
+  // to .github/attachments/ in the repo so it has a stable public URL that
+  // GitHub's issue renderer can display inline.
+  async function uploadAttachment(repo, filename, buffer) {
+    const safeName = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+    const path = `.github/attachments/${safeName}`;
+    const { data } = await octokit.rest.repos.createOrUpdateFileContents({
+      owner: githubOwner,
+      repo,
+      path,
+      message: `Add issue attachment: ${filename}`,
+      content: buffer.toString("base64"),
+    });
+    return data.content.download_url;
+  }
+
   return {
     getRepos,
     getLabels,
@@ -323,5 +328,6 @@ export function createGitHubHelpers(octokit, githubOwner) {
     getIssue,
     searchIssues,
     addIssueComment,
+    uploadAttachment,
   };
 }

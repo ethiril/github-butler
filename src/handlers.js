@@ -10,6 +10,35 @@ import { fetchThreadMessages, compileThreadWithMeta, deriveTitle } from "./threa
 import { buildIssueCard, buildCardMeta } from "./card.js";
 import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs } from "./thread-store.js";
 
+// Downloads each image file from Slack (using the bot token) and uploads it to
+// the GitHub repo so it has a stable URL that renders inline in issue markdown.
+// Results are cached by Slack file ID — each file is only uploaded once per
+// issue creation flow even if the same image appears in multiple messages.
+function makeImageUploader(github, repo) {
+  const cache = new Map();
+  return (file) => {
+    if (!cache.has(file.id)) {
+      cache.set(file.id, (async () => {
+        const response = await fetch(file.url_private, {
+          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        });
+        if (!response.ok) return null;
+        const contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("text/html")) {
+          console.warn("[handlers] Slack returned HTML for file download — bot token may be missing files:read scope");
+          return null;
+        }
+        const buffer = Buffer.from(await response.arrayBuffer());
+        return github.uploadAttachment(repo, file.name ?? file.id, buffer);
+      })().catch((err) => {
+        console.warn(`[handlers] image upload failed for ${file.name ?? file.id}:`, err.message);
+        return null;
+      }));
+    }
+    return cache.get(file.id);
+  };
+}
+
 // GitHub repo names: alphanumeric, hyphen, underscore, dot; cannot start with
 // dot or hyphen; max 100 chars. Validated before making any API call with a
 // user-supplied repo name (e.g., from emoji suffix routing).
@@ -21,27 +50,6 @@ function isValidRepoName(name) {
 // Return only the message from an error — never expose stack traces or tokens.
 function safeErrMsg(err) {
   return err?.message ?? "An unexpected error occurred.";
-}
-
-function summarizeBlocks(blocks) {
-  return blocks.map((block, i) => ({
-    i,
-    type: block.type,
-    block_id: block.block_id ?? null,
-    text_len: typeof block.text?.text === "string" ? block.text.text.length : 0,
-    elements: Array.isArray(block.elements)
-      ? block.elements.map((el) => ({
-          type: el.type,
-          action_id: el.action_id ?? null,
-          options: Array.isArray(el.options) ? el.options.length : 0,
-          initial_options: Array.isArray(el.initial_options) ? el.initial_options.length : 0,
-          value_len: typeof el.value === "string" ? el.value.length : 0,
-          text_len: typeof el.text?.text === "string" ? el.text.text.length : 0,
-          placeholder_len:
-            typeof el.placeholder?.text === "string" ? el.placeholder.text.length : 0,
-        }))
-      : undefined,
-  }));
 }
 
 function collectModalProjectFieldValues(stateValues = {}) {
@@ -96,9 +104,21 @@ function collectCardProjectFieldValues(projectFields = [], stateValues = {}, car
   return Object.fromEntries(Object.entries(out).filter(([, v]) => v != null));
 }
 
-// ── Issue card helper ─────────────────────────────────────────────────────────
 // Fetches repo metadata and posts an inline issue-creation card as an ephemeral
 // message. Used by emoji reactions and the Quick Create button from @mentions.
+// Parse REPO_DEFAULT_LABELS env var: JSON map of repo → label names array.
+// Returns the label names for the given repo, or [] if not configured.
+function getRepoDefaultLabels(repo) {
+  const raw = process.env.REPO_DEFAULT_LABELS;
+  if (!raw) return [];
+  try {
+    const map = JSON.parse(raw);
+    return Array.isArray(map[repo]) ? map[repo] : [];
+  } catch {
+    console.warn("[handlers] REPO_DEFAULT_LABELS is not valid JSON — ignoring");
+    return [];
+  }
+}
 
 async function postIssueCard({ client, github, channelId, threadTs, userId, messageText, permalink, repo }) {
   const defaults = getUserDefaults(userId);
@@ -118,11 +138,20 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
   const statusField = projectFields.find((f) => /status/i.test(f.name)) ?? null;
   const typeField = projectFields.find((f) => /^type$/i.test(f.name)) ?? null;
   const title = deriveTitle(messageText);
+  // Use lines after the first as the body; avoids duplicating the title in the body
+  const bodyLines = messageText.split("\n").slice(1).join("\n").trim();
+
+  // Repo-level label defaults take priority over per-user saved defaults.
+  // Label names from the env are matched against the fetched label list to get their values.
+  const repoLabelNames = getRepoDefaultLabels(repo);
+  const defaultLabelValues = repoLabelNames.length > 0
+    ? labels.filter((l) => repoLabelNames.includes(l.text)).map((l) => l.value)
+    : (defaults.labelValues ?? []);
 
   const cardMeta = buildCardMeta({
     repo,
     title,
-    messageText,
+    messageText: bodyLines,
     channelId,
     threadTs,
     userId,
@@ -131,7 +160,7 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     priorityField,
     statusField,
     typeField,
-    defaultLabelValues: defaults.labelValues ?? [],
+    defaultLabelValues,
     defaultMilestoneValue: defaults.milestoneValue ?? null,
   });
 
@@ -143,50 +172,18 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     priorityField,
     statusField,
     typeField,
-    defaultLabelValues: defaults.labelValues ?? [],
+    defaultLabelValues,
     defaultMilestoneValue: defaults.milestoneValue ?? null,
     cardMeta,
   });
 
-  const blockSummary = summarizeBlocks(blocks);
-
-  console.log("[issue-card] repo:", repo);
-  console.log("[issue-card] counts:", {
-    labels: labels.length,
-    milestones: milestones.length,
-    projectFields: projectFields.length,
-    typeOptions: typeField?.options?.length ?? 0,
-    priorityOptions: priorityField?.options?.length ?? 0,
-    statusOptions: statusField?.options?.length ?? 0,
+  await client.chat.postEphemeral({
+    channel: channelId,
+    user: userId,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+    text: `New issue: ${title}`,
+    blocks,
   });
-
-  console.log("[issue-card] cardMeta lengths:", {
-    json: JSON.stringify(cardMeta).length,
-    title: String(cardMeta.title ?? "").length,
-    messageText: String(cardMeta.messageText ?? "").length,
-    permalink: String(cardMeta.permalink ?? "").length,
-    defaultLabelValues: Array.isArray(cardMeta.defaultLabelValues)
-      ? cardMeta.defaultLabelValues.length
-      : 0,
-  });
-
-  console.log("[issue-card] block summary:", JSON.stringify(blockSummary, null, 2));
-  console.log("[issue-card] full blocks:", JSON.stringify(blocks, null, 2));
-
-  try {
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: userId,
-      ...(threadTs ? { thread_ts: threadTs } : {}),
-      text: `New issue: ${title}`,
-      blocks,
-    });
-  } catch (err) {
-    console.error("[issue-card] Slack rejected blocks:", err?.data ?? err);
-    console.error("[issue-card] rejected block summary:", JSON.stringify(blockSummary, null, 2));
-    console.error("[issue-card] rejected full blocks:", JSON.stringify(blocks, null, 2));
-    throw err;
-  }
 }
 
 // ── Issue display helper ──────────────────────────────────────────────────────
@@ -340,10 +337,139 @@ export function registerHandlers(app, github) {
   // 3. @mention in a thread → ephemeral message with Create Issue + Quick Create buttons
   // Workaround: Slack does not provide a trigger_id on message events,
   // so a modal cannot be opened directly. The button click provides one.
-  // Usage: @GitHub Butler [optional title]
+  //
+  // Usage:
+  //   @GitHub Butler              → show buttons (normal flow)
+  //   @GitHub Butler some title   → pre-fill title in buttons
+  //   @GitHub Butler ^            → auto quick-create from the previous message
+  //   @GitHub Butler summarise ^  → same; any text ending in ^ triggers this
   app.event("app_mention", async ({ event, client }) => {
-    const issueTitle = event.text.replace(/<@[^>]+>/g, "").trim();
+    const rawText = event.text.replace(/<@[^>]+>/g, "").trim();
     const threadTs = event.thread_ts ?? event.ts;
+
+    // Caret shortcut: text ends with "^"
+    // If the thread already has a linked issue → append new messages as a comment (tag update).
+    // Otherwise → show the issue card pre-filled from the previous non-bot message.
+    if (rawText.endsWith("^")) {
+      const userId = event.user;
+
+      // Tag update: check for an existing thread → issue mapping
+      const existingIssue = await getThreadIssue(threadTs);
+      if (existingIssue) {
+        const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
+        const allMessages = await fetchThreadMessages(client, event.channel, threadTs);
+        const newContent = await compileThreadWithMeta(client, allMessages, {
+          sinceTs: lastSyncedTs,
+          imageUploader: makeImageUploader(github, issueRepo),
+        });
+
+        if (!newContent) {
+          await client.chat.postEphemeral({
+            channel: event.channel,
+            user: userId,
+            thread_ts: threadTs,
+            text: `No new messages to add to ${issueRepo}#${issueNumber} since last sync.`,
+          });
+          return;
+        }
+
+        const latestTs = allMessages[allMessages.length - 1]?.ts ?? lastSyncedTs;
+
+        try {
+          const comment = await github.addIssueComment(
+            issueRepo,
+            issueNumber,
+            `${newContent}\n\n---\n_Updated from Slack_`
+          );
+          await updateThreadIssueSyncTs(threadTs, latestTs);
+          await client.chat.postMessage({
+            channel: event.channel,
+            thread_ts: threadTs,
+            unfurl_links: false,
+            text: `Thread update added to <${comment.html_url}|${issueRepo}#${issueNumber}>`,
+          });
+        } catch (err) {
+          console.error("Caret tag update failed:", err);
+          await client.chat.postEphemeral({
+            channel: event.channel,
+            user: userId,
+            thread_ts: threadTs,
+            text: `Failed to update issue: ${safeErrMsg(err)}`,
+          });
+        }
+        return;
+      }
+
+      // No existing issue → show card from the previous non-bot message
+      const defaults = getUserDefaults(userId);
+
+      if (!defaults.repo) {
+        await client.chat.postEphemeral({
+          channel: event.channel,
+          user: userId,
+          thread_ts: threadTs,
+          text: "No default repo saved. Use *Create Issue* (form) once to set your preferences.",
+        });
+        return;
+      }
+
+      let prevMessage = null;
+
+      if (event.thread_ts) {
+        // In a thread: find the last non-bot message before this @mention
+        const threadMsgs = await fetchThreadMessages(client, event.channel, event.thread_ts);
+        prevMessage = [...threadMsgs]
+          .filter((m) => parseFloat(m.ts) < parseFloat(event.ts) && !m.bot_id)
+          .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts))[0] ?? null;
+      } else {
+        // Top-level: fetch the message immediately above in the channel
+        const historyResult = await client.conversations.history({
+          channel: event.channel,
+          latest: event.ts,
+          inclusive: false,
+          limit: 1,
+        }).catch(() => null);
+        prevMessage = historyResult?.messages?.[0] ?? null;
+      }
+
+      if (!prevMessage) {
+        await client.chat.postEphemeral({
+          channel: event.channel,
+          user: userId,
+          thread_ts: threadTs,
+          text: "No previous message found to create an issue from.",
+        });
+        return;
+      }
+
+      const permalinkResult = await client.chat.getPermalink({
+        channel: event.channel,
+        message_ts: prevMessage.ts,
+      }).catch(() => null);
+
+      await postIssueCard({
+        client,
+        github,
+        channelId: event.channel,
+        threadTs,
+        userId,
+        messageText: prevMessage.text ?? "",
+        permalink: permalinkResult?.permalink ?? "",
+        repo: defaults.repo,
+      }).catch(async (err) => {
+        console.error("Failed to post issue card from caret mention:", err);
+        await client.chat.postEphemeral({
+          channel: event.channel,
+          user: userId,
+          thread_ts: threadTs,
+          text: `Failed to create issue card: ${safeErrMsg(err)}`,
+        });
+      });
+      return;
+    }
+
+    // Normal flow: show Create Issue + Quick Create buttons
+    const issueTitle = rawText;
 
     const slackMessageContext = {
       channelId: event.channel,
@@ -452,6 +578,7 @@ export function registerHandlers(app, github) {
   app.event("reaction_added", async ({ event, client }) => {
     const BUTLER_SUFFIX = "_github_butler";
     const reaction = event.reaction;
+    console.log("[reaction] received", { reaction, itemType: event.item?.type });
 
     let repo = null;
     if (reaction === "github_butler") {
@@ -459,13 +586,19 @@ export function registerHandlers(app, github) {
       repo = defaults.repo ?? null;
     } else if (reaction.endsWith(BUTLER_SUFFIX)) {
       const candidate = reaction.slice(0, -BUTLER_SUFFIX.length);
-      if (!isValidRepoName(candidate)) return;
+      if (!isValidRepoName(candidate)) {
+        console.log("[reaction] invalid repo name in emoji, ignoring", { candidate });
+        return;
+      }
       repo = candidate;
     } else {
-      return;
+      return; // not a butler emoji, ignore silently
     }
 
-    if (event.item.type !== "message") return;
+    if (event.item.type !== "message") {
+      console.log("[reaction] item is not a message, ignoring", { itemType: event.item.type });
+      return;
+    }
 
     const channelId = event.item.channel;
     const messageTs = event.item.ts;
@@ -475,20 +608,29 @@ export function registerHandlers(app, github) {
       latest: messageTs,
       inclusive: true,
       limit: 1,
-    }).catch(() => null);
+    }).catch((err) => {
+      console.error("[reaction] conversations.history failed", err?.data?.error ?? err?.message);
+      return null;
+    });
 
     const message = historyResult?.messages?.[0];
-    if (!message) return;
+    if (!message) {
+      console.warn("[reaction] could not fetch reacted message", { channelId, messageTs });
+      return;
+    }
 
     const threadTs = message.thread_ts ?? message.ts;
     const userId = event.user;
 
     // Check for an existing thread → issue mapping (tag update flow)
-    const existingIssue = getThreadIssue(threadTs);
+    const existingIssue = await getThreadIssue(threadTs);
     if (existingIssue) {
       const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
       const allMessages = await fetchThreadMessages(client, channelId, threadTs);
-      const newContent = await compileThreadWithMeta(client, allMessages, { sinceTs: lastSyncedTs });
+      const newContent = await compileThreadWithMeta(client, allMessages, {
+        sinceTs: lastSyncedTs,
+        imageUploader: makeImageUploader(github, issueRepo),
+      });
 
       if (!newContent) {
         await client.chat.postEphemeral({
@@ -508,7 +650,7 @@ export function registerHandlers(app, github) {
           issueNumber,
           `${newContent}\n\n---\n_Updated from Slack_`
         );
-        updateThreadIssueSyncTs(threadTs, latestTs);
+        await updateThreadIssueSyncTs(threadTs, latestTs);
         await client.chat.postMessage({
           channel: channelId,
           thread_ts: threadTs,
@@ -805,7 +947,9 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs);
+      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
+        imageUploader: makeImageUploader(github, selectedRepo),
+      });
       if (threadContent) {
         issueBody = issueBody ? `${issueBody}\n\n${threadContent}` : threadContent;
       }
@@ -852,7 +996,7 @@ export function registerHandlers(app, github) {
         const latestTs = threadMsgs.length > 0
           ? threadMsgs[threadMsgs.length - 1].ts
           : slackMessageContext.threadTs;
-        registerThreadIssue(slackMessageContext.threadTs, selectedRepo, createdIssue.number, latestTs);
+        await registerThreadIssue(slackMessageContext.threadTs, selectedRepo, createdIssue.number, latestTs);
       }
 
       await client.chat.postMessage({
@@ -908,7 +1052,9 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs);
+      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
+        imageUploader: makeImageUploader(github, selectedRepo),
+      });
       if (threadContent) {
         commentBody = commentBody ? `${commentBody}\n\n${threadContent}` : threadContent;
       }
@@ -971,7 +1117,9 @@ export function registerHandlers(app, github) {
     if (cardMeta.threadTs) {
       const threadMsgs = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs);
       if (threadMsgs.length > 1) {
-        const threadContent = await compileThreadWithMeta(client, threadMsgs);
+        const threadContent = await compileThreadWithMeta(client, threadMsgs, {
+          imageUploader: makeImageUploader(github, cardMeta.repo),
+        });
         if (threadContent) issueBody = threadContent;
       }
     }
@@ -1036,7 +1184,7 @@ export function registerHandlers(app, github) {
       if (cardMeta.threadTs) {
         const allMsgs = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs).catch(() => []);
         const latestTs = allMsgs.length > 0 ? allMsgs[allMsgs.length - 1].ts : cardMeta.threadTs;
-        registerThreadIssue(cardMeta.threadTs, cardMeta.repo, createdIssue.number, latestTs);
+        await registerThreadIssue(cardMeta.threadTs, cardMeta.repo, createdIssue.number, latestTs);
       }
 
       await respond({ delete_original: true });
