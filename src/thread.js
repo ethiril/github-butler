@@ -112,13 +112,11 @@ async function decodeSlackText(text, userCache, client) {
 }
 
 // Enriches each message with the author's display name, timestamp, decoded text,
-// and any image attachments.
+// and links to any image attachments.
 //
 // Options:
-//   sinceTs      — only include messages newer than this Slack ts (tag update flow)
-//   imageUploader — async fn(slackFile) => url | null; called for each image attachment.
-//                   When provided, images are included as Markdown image references.
-export async function compileThreadWithMeta(client, messages, { sinceTs, imageUploader } = {}) {
+//   sinceTs — only include messages newer than this Slack ts (tag update flow)
+export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) {
   const filtered = sinceTs
     ? messages.filter((msg) => parseFloat(msg.ts) > parseFloat(sinceTs))
     : messages;
@@ -130,7 +128,7 @@ export async function compileThreadWithMeta(client, messages, { sinceTs, imageUp
   const parts = await Promise.all(
     filtered.map(async (msg) => {
       // file_share messages carry the filename as msg.text — suppress it since
-      // we render the actual file as an image or link below.
+      // we render the actual file as a link below.
       const rawText = msg.subtype === "file_share" ? "" : (msg.text ?? "").trim();
       const text = rawText ? await decodeSlackText(rawText, userCache, client) : "";
 
@@ -141,16 +139,10 @@ export async function compileThreadWithMeta(client, messages, { sinceTs, imageUp
         ...(msg.file ? [msg.file] : []),
       ];
 
-      // Collect image lines from file attachments
-      const imageLines = [];
-      if (imageUploader && allFiles.length > 0) {
-        for (const file of allFiles) {
-          if (!file.mimetype?.startsWith("image/")) continue;
-          const url = await imageUploader(file);
-          const label = file.name ?? "image";
-          imageLines.push(url ? `![${label}](${url})` : `[${label}](${file.permalink ?? ""})`);
-        }
-      }
+      // Link to image attachments via their Slack permalink
+      const imageLines = allFiles
+        .filter((file) => file.mimetype?.startsWith("image/"))
+        .map((file) => `[${file.name ?? "image"}](${file.permalink ?? ""})`);
 
       if (!text && imageLines.length === 0) return null;
 

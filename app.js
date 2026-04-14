@@ -30,6 +30,18 @@ if (process.env.SLACK_GITHUB_ISSUES_SECRET_ID) {
 
 const isSocketMode = !!process.env.SLACK_APP_TOKEN;
 
+// ── Validate env vars before Bolt tries to read them ─────────────────────────
+
+const requiredEnvVars = isSocketMode
+  ? ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "GITHUB_TOKEN", "GITHUB_OWNER"]
+  : ["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "GITHUB_TOKEN", "GITHUB_OWNER"];
+
+const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
+if (missingEnvVars.length > 0) {
+  console.error(`[error] Missing required environment variables: ${missingEnvVars.join(", ")}`);
+  process.exit(1);
+}
+
 let awsLambdaReceiver;
 let app;
 
@@ -53,18 +65,6 @@ const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 const github = createGitHubHelpers(octokit, process.env.GITHUB_OWNER);
 
 registerHandlers(app, github);
-
-// ── Start ─────────────────────────────────────────────────────────────────────
-
-const requiredEnvVars = isSocketMode
-  ? ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "GITHUB_TOKEN", "GITHUB_OWNER"]
-  : ["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "GITHUB_TOKEN", "GITHUB_OWNER"];
-
-const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
-if (missingEnvVars.length > 0) {
-  console.error(`[error] Missing required environment variables: ${missingEnvVars.join(", ")}`);
-  process.exit(1);
-}
 
 if (isSocketMode) {
   (async () => {

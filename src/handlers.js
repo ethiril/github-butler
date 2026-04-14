@@ -10,35 +10,6 @@ import { fetchThreadMessages, compileThreadWithMeta, deriveTitle } from "./threa
 import { buildIssueCard, buildCardMeta } from "./card.js";
 import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs } from "./thread-store.js";
 
-// Downloads each image file from Slack (using the bot token) and uploads it to
-// the GitHub repo so it has a stable URL that renders inline in issue markdown.
-// Results are cached by Slack file ID — each file is only uploaded once per
-// issue creation flow even if the same image appears in multiple messages.
-function makeImageUploader(github, repo) {
-  const cache = new Map();
-  return (file) => {
-    if (!cache.has(file.id)) {
-      cache.set(file.id, (async () => {
-        const response = await fetch(file.url_private, {
-          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        });
-        if (!response.ok) return null;
-        const contentType = response.headers.get("content-type") ?? "";
-        if (contentType.includes("text/html")) {
-          console.warn("[handlers] Slack returned HTML for file download — bot token may be missing files:read scope");
-          return null;
-        }
-        const buffer = Buffer.from(await response.arrayBuffer());
-        return github.uploadAttachment(repo, file.name ?? file.id, buffer);
-      })().catch((err) => {
-        console.warn(`[handlers] image upload failed for ${file.name ?? file.id}:`, err.message);
-        return null;
-      }));
-    }
-    return cache.get(file.id);
-  };
-}
-
 // GitHub repo names: alphanumeric, hyphen, underscore, dot; cannot start with
 // dot or hyphen; max 100 chars. Validated before making any API call with a
 // user-supplied repo name (e.g., from emoji suffix routing).
@@ -360,7 +331,6 @@ export function registerHandlers(app, github) {
         const allMessages = await fetchThreadMessages(client, event.channel, threadTs);
         const newContent = await compileThreadWithMeta(client, allMessages, {
           sinceTs: lastSyncedTs,
-          imageUploader: makeImageUploader(github, issueRepo),
         });
 
         if (!newContent) {
@@ -629,7 +599,6 @@ export function registerHandlers(app, github) {
       const allMessages = await fetchThreadMessages(client, channelId, threadTs);
       const newContent = await compileThreadWithMeta(client, allMessages, {
         sinceTs: lastSyncedTs,
-        imageUploader: makeImageUploader(github, issueRepo),
       });
 
       if (!newContent) {
@@ -947,9 +916,7 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-        imageUploader: makeImageUploader(github, selectedRepo),
-      });
+      const threadContent = await compileThreadWithMeta(client, threadMsgs);
       if (threadContent) {
         issueBody = issueBody ? `${issueBody}\n\n${threadContent}` : threadContent;
       }
@@ -1052,9 +1019,7 @@ export function registerHandlers(app, github) {
         slackMessageContext.channelId,
         slackMessageContext.threadTs
       );
-      const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-        imageUploader: makeImageUploader(github, selectedRepo),
-      });
+      const threadContent = await compileThreadWithMeta(client, threadMsgs);
       if (threadContent) {
         commentBody = commentBody ? `${commentBody}\n\n${threadContent}` : threadContent;
       }
@@ -1117,9 +1082,7 @@ export function registerHandlers(app, github) {
     if (cardMeta.threadTs) {
       const threadMsgs = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs);
       if (threadMsgs.length > 1) {
-        const threadContent = await compileThreadWithMeta(client, threadMsgs, {
-          imageUploader: makeImageUploader(github, cardMeta.repo),
-        });
+        const threadContent = await compileThreadWithMeta(client, threadMsgs);
         if (threadContent) issueBody = threadContent;
       }
     }

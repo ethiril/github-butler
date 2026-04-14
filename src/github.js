@@ -297,22 +297,6 @@ export function createGitHubHelpers(octokit, githubOwner) {
     return data;
   }
 
-  // Downloads an image from Slack (caller provides the buffer) and uploads it
-  // to .github/attachments/ in the repo so it has a stable public URL that
-  // GitHub's issue renderer can display inline.
-  async function uploadAttachment(repo, filename, buffer) {
-    const safeName = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-    const path = `.github/attachments/${safeName}`;
-    const { data } = await octokit.rest.repos.createOrUpdateFileContents({
-      owner: githubOwner,
-      repo,
-      path,
-      message: `Add issue attachment: ${filename}`,
-      content: buffer.toString("base64"),
-    });
-    return data.content.download_url;
-  }
-
   return {
     getRepos,
     getLabels,
@@ -328,6 +312,5 @@ export function createGitHubHelpers(octokit, githubOwner) {
     getIssue,
     searchIssues,
     addIssueComment,
-    uploadAttachment,
   };
 }
