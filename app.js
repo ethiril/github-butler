@@ -1,26 +1,20 @@
 import bolt from "@slack/bolt";
 import { Octokit } from "@octokit/rest";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { createGitHubHelpers } from "./src/github.js";
 import { registerHandlers } from "./src/handlers.js";
 
 const { App, AwsLambdaReceiver } = bolt;
 
-// When running on Lambda, SLACK_GITHUB_ISSUES_SECRET_ID is set and the real
-// token values are never in the environment at deploy time. The Parameters &
-// Secrets Lambda extension exposes them over a local HTTP endpoint so we can
-// populate process.env before Bolt reads it. In Socket Mode this block is
-// skipped entirely.
-if (process.env.SLACK_GITHUB_ISSUES_SECRET_ID) {
-  const secretId = process.env.SLACK_GITHUB_ISSUES_SECRET_ID;
-  const port = process.env.PARAMETERS_SECRETS_EXTENSION_HTTP_PORT ?? 2773;
-  const res = await fetch(
-    `http://localhost:${port}/secretsmanager/get?secretId=${encodeURIComponent(secretId)}`,
-    { headers: { "X-Aws-Parameters-Secrets-Token": process.env.AWS_SESSION_TOKEN } }
+// When running on Lambda, GITHUB_BUTLER_SECRET_ID is set and the real
+// token values are never in the environment at deploy time. We fetch them
+// directly from Secrets Manager at init time and populate process.env before
+// Bolt reads it. In Socket Mode this block is skipped entirely.
+if (process.env.GITHUB_BUTLER_SECRET_ID) {
+  const client = new SecretsManagerClient({});
+  const { SecretString } = await client.send(
+    new GetSecretValueCommand({ SecretId: process.env.GITHUB_BUTLER_SECRET_ID })
   );
-  if (!res.ok) {
-    throw new Error(`Parameters & Secrets extension returned HTTP ${res.status} for secret "${secretId}"`);
-  }
-  const { SecretString } = await res.json();
   Object.assign(process.env, JSON.parse(SecretString));
 }
 

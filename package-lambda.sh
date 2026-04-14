@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUTPUT="${1:-function.zip}"
+OUTPUT="${1:-github_butler.zip}"
 
 echo "→ Installing production dependencies…"
 npm ci --omit=dev

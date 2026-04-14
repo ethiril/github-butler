@@ -151,7 +151,7 @@ Right-click any message → **Add to GitHub Issue**. Pick the repo and issue num
 | `DEFAULT_GITHUB_PROJECT` | optional | Project name to pre-select for all users (must match the project title exactly) |
 | `REPO_DEFAULT_LABELS` | optional | JSON map of repo → label names to pre-select on the issue card. E.g. `{"my-repo":["bug","triage"]}`. Overrides per-user saved defaults. |
 | `DYNAMODB_TABLE` | optional | DynamoDB table name for persistent thread→issue mapping. Without it, mappings are in-memory only (lost on restart). Table must have a String PK named `threadTs` with no sort key. Recommended for Lambda deployments. |
-| `SLACK_GITHUB_ISSUES_SECRET_ID` | Lambda + Secrets Manager | AWS Secrets Manager secret ID containing all other env vars as a JSON object. When set, the app fetches secrets at cold-start via the [Parameters & Secrets Lambda extension](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets_lambda.html) instead of reading them from environment variables. |
+| `GITHUB_BUTLER_SECRET_ID` | Lambda + Secrets Manager | AWS Secrets Manager secret ID containing all other env vars as a JSON object. When set, the app fetches secrets at cold-start via the [Parameters & Secrets Lambda extension](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets_lambda.html) instead of reading them from environment variables. |
 
 ---
 
@@ -229,9 +229,9 @@ No persistent process — effectively free at this usage level (~$0.25/month for
 
 ```bash
 chmod +x package-lambda.sh
-./package-lambda.sh            # produces function.zip
+./package-lambda.sh            # produces github_butler.zip
 # or specify a custom output path:
-./package-lambda.sh dist/function.zip
+./package-lambda.sh dist/github_butler.zip
 ```
 
 This installs production-only dependencies and zips `app.js`, `src/`, and `node_modules/`.
@@ -250,7 +250,7 @@ This installs production-only dependencies and zips `app.js`, `src/`, and `node_
 ```bash
 aws lambda update-function-code \
   --function-name <your-function-name> \
-  --zip-file fileb://function.zip \
+  --zip-file fileb://github_butler.zip \
   --region us-east-1
 ```
 
@@ -259,15 +259,15 @@ aws lambda update-function-code \
 ```hcl
 resource "aws_lambda_function" "github_butler" {
   function_name    = "github-butler"
-  filename         = "function.zip"
-  source_code_hash = filebase64sha256("function.zip")
+  filename         = "github_butler.zip"
+  source_code_hash = filebase64sha256("github_butler.zip")
   handler          = "app.handler"
   runtime          = "nodejs22.x"
   role             = aws_iam_role.lambda_exec.arn
 
   environment {
     variables = {
-      SLACK_GITHUB_ISSUES_SECRET_ID = aws_secretsmanager_secret.bot.name
+      GITHUB_BUTLER_SECRET_ID = aws_secretsmanager_secret.bot.name
     }
   }
 }
@@ -308,7 +308,7 @@ Store all secrets in a single Secrets Manager secret as a JSON object:
 Then set only one env var on the function:
 
 ```
-SLACK_GITHUB_ISSUES_SECRET_ID = <secret-name-or-arn>
+GITHUB_BUTLER_SECRET_ID = <secret-name-or-arn>
 ```
 
 The app fetches and injects secrets at cold-start via the [Parameters & Secrets Lambda extension](https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieving-secrets_lambda.html). Add the extension as a Lambda layer and grant `secretsmanager:GetSecretValue` to the function's execution role.
