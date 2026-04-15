@@ -6,7 +6,20 @@ import {
   resolveDefaultProjectId,
 } from "./modal.js";
 import { fetchThreadMessages, compileThreadWithMeta, deriveTitle } from "./thread.js";
-import { buildIssueCard, buildCardMeta } from "./card.js";
+import {
+  buildIssueCard,
+  buildCardMeta,
+  resolveCardFields,
+  cardFieldBlockId,
+  cardFieldActionId,
+  CARD_TITLE_BLOCK_ID,
+  CARD_TITLE_ACTION_ID,
+  CARD_LABELS_BLOCK_ID,
+  CARD_LABELS_ACTION_ID,
+  CARD_MILESTONE_BLOCK_ID,
+  CARD_MILESTONE_ACTION_ID,
+  CARD_MILESTONE_NONE_VALUE,
+} from "./card.js";
 import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs, claimCardPost, releaseCardPost } from "./thread-store.js";
 
 // Deduplication: prevents duplicate modal opens or issue creations from Lambda
@@ -97,37 +110,29 @@ function collectModalProjectFieldValues(stateValues = {}) {
   return out;
 }
 
+// Translates the card's current single-select state into the `pf_<index>` keys
+// used by the full modal (which iterates project fields by index). Used when a
+// user clicks "Customize" and we need to carry their inline card selections
+// into the opened modal.
 function collectCardProjectFieldValues(projectFields = [], stateValues = {}, cardMeta = {}) {
-  const out = {};
+  const selectedOptionIdByFieldId = new Map();
 
-  projectFields.forEach((field, index) => {
-    const blockId = `pf_${index}`;
-    const name = field.name.toLowerCase();
+  for (const cardField of cardMeta.cardFields ?? []) {
+    if (!cardField?.fieldId) continue;
+    const selectedOptionId =
+      stateValues[cardFieldBlockId(cardField.key)]?.[cardFieldActionId(cardField.key)]?.selected_option?.value
+      ?? cardField.defaultOptionId
+      ?? null;
+    if (selectedOptionId) selectedOptionIdByFieldId.set(cardField.fieldId, selectedOptionId);
+  }
 
-    if (field.dataType === "SINGLE_SELECT") {
-      if (name === "priority") {
-        out[blockId] =
-          stateValues.card_priority?.card_priority_select?.selected_option?.value ??
-          stateValues.card_selections?.card_priority_select?.selected_option?.value ??
-          cardMeta.defaultPriorityOptionId ??
-          null;
-      } else if (name === "status") {
-        out[blockId] =
-          stateValues.card_status?.card_status_select?.selected_option?.value ??
-          stateValues.card_selections?.card_status_select?.selected_option?.value ??
-          cardMeta.defaultStatusOptionId ??
-          null;
-      } else if (name === "type") {
-        out[blockId] =
-          stateValues.card_type?.card_type_select?.selected_option?.value ??
-          stateValues.card_selections?.card_type_select?.selected_option?.value ??
-          cardMeta.defaultTypeOptionId ??
-          null;
-      }
-    }
+  const modalFieldValuesByBlockId = {};
+  projectFields.forEach((projectField, projectFieldIndex) => {
+    const selectedOptionId = selectedOptionIdByFieldId.get(projectField?.id);
+    if (selectedOptionId) modalFieldValuesByBlockId[`pf_${projectFieldIndex}`] = selectedOptionId;
   });
 
-  return Object.fromEntries(Object.entries(out).filter(([, v]) => v != null));
+  return modalFieldValuesByBlockId;
 }
 
 // Fetches repo metadata and posts an inline issue-creation card as an ephemeral
@@ -147,7 +152,7 @@ function getRepoDefaultLabels(repo) {
 }
 
 async function postIssueCard({ client, github, channelId, threadTs, userId, messageText, permalink, repo }) {
-  const defaults = getUserDefaults(userId);
+  const userDefaults = getUserDefaults(userId);
 
   const [labels, milestones, allProjects] = await Promise.all([
     github.getLabels(repo),
@@ -155,50 +160,46 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     github.getProjects(),
   ]);
 
-  const projectId = resolveDefaultProjectId(allProjects, defaults.projectId, process.env.DEFAULT_GITHUB_PROJECT);
+  const projectId = resolveDefaultProjectId(allProjects, userDefaults.projectId, process.env.DEFAULT_GITHUB_PROJECT);
   const projectFields = projectId
     ? await github.getProjectFields(projectId).catch(() => [])
     : [];
 
-  const priorityField = projectFields.find((f) => /priority/i.test(f.name)) ?? null;
-  const statusField = projectFields.find((f) => /status/i.test(f.name)) ?? null;
-  const projectTypeField = projectFields.find((f) => /^type$/i.test(f.name)) ?? null;
-
-  // Prefer native org issue types over a project SINGLE_SELECT field named "Type".
-  // Native types are always fetched so they show even without a default project.
-  const nativeIssueTypes = projectTypeField
+  // Native org issue types are only fetched when no project field named "Type"
+  // exists — a project-level Type field takes precedence when present.
+  const hasProjectTypeField = projectFields.some((field) => /^type$/i.test(field?.name ?? ""));
+  const nativeIssueTypes = hasProjectTypeField
     ? []
     : await github.getIssueTypes().catch(() => []);
-  const isNativeType = nativeIssueTypes.length > 0;
-  const typeField = projectTypeField
-    ?? (isNativeType ? { id: null, name: "Type", options: nativeIssueTypes } : null);
-  console.log(`[postIssueCard] type: projectTypeField=${projectTypeField?.name ?? "none"}, nativeTypes=${nativeIssueTypes.length}, typeField=${typeField?.name ?? "none"} (${typeField?.options?.length ?? 0} options)`);
+
+  const cardFields = resolveCardFields(projectFields, nativeIssueTypes);
+  console.log(
+    `[postIssueCard] cardFields: ${cardFields.map((field) => `${field.key}(${field.options.length}${field.isNativeType ? ",native" : ""})`).join(", ") || "none"}`
+  );
+
   const title = deriveTitle(messageText);
   // Use lines after the first as the body; avoids duplicating the title in the body
-  const bodyLines = messageText.split("\n").slice(1).join("\n").trim();
+  const bodyLinesAfterTitle = messageText.split("\n").slice(1).join("\n").trim();
 
   // Repo-level label defaults take priority over per-user saved defaults.
   // Label names from the env are matched against the fetched label list to get their values.
   const repoLabelNames = getRepoDefaultLabels(repo);
   const defaultLabelValues = repoLabelNames.length > 0
-    ? labels.filter((l) => repoLabelNames.includes(l.text)).map((l) => l.value)
-    : (defaults.labelValues ?? []);
+    ? labels.filter((label) => repoLabelNames.includes(label.text)).map((label) => label.value)
+    : (userDefaults.labelValues ?? []);
 
   const cardMeta = buildCardMeta({
     repo,
     title,
-    messageText: bodyLines,
+    messageText: bodyLinesAfterTitle,
     channelId,
     threadTs,
     userId,
     permalink,
     projectId,
-    priorityField,
-    statusField,
-    typeField,
-    isNativeType,
+    cardFields,
     defaultLabelValues,
-    defaultMilestoneValue: defaults.milestoneValue ?? null,
+    defaultMilestoneValue: userDefaults.milestoneValue ?? null,
   });
 
   const blocks = buildIssueCard({
@@ -206,11 +207,9 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     title,
     labels,
     milestones,
-    priorityField,
-    statusField,
-    typeField,
+    cardFields,
     defaultLabelValues,
-    defaultMilestoneValue: defaults.milestoneValue ?? null,
+    defaultMilestoneValue: userDefaults.milestoneValue ?? null,
     cardMeta,
   });
 
@@ -1105,40 +1104,35 @@ export function registerHandlers(app, github) {
     const stateValues = body.state?.values ?? {};
 
     // Read title from the inline input — falls back to the auto-derived title stored in cardMeta
-    const issueTitle = stateValues.card_title_block?.card_title_input?.value?.trim() || cardMeta.title;
+    const issueTitle =
+      stateValues[CARD_TITLE_BLOCK_ID]?.[CARD_TITLE_ACTION_ID]?.value?.trim() || cardMeta.title;
 
-    const typeOptionId =
-      stateValues.card_type?.card_type_select?.selected_option?.value ??
-      stateValues.card_selections?.card_type_select?.selected_option?.value ??
-      cardMeta.defaultTypeOptionId;
-
-    const priorityOptionId =
-      stateValues.card_priority?.card_priority_select?.selected_option?.value ??
-      stateValues.card_selections?.card_priority_select?.selected_option?.value ??
-      cardMeta.defaultPriorityOptionId;
-
-    const statusOptionId =
-      stateValues.card_status?.card_status_select?.selected_option?.value ??
-      stateValues.card_selections?.card_status_select?.selected_option?.value ??
-      cardMeta.defaultStatusOptionId;
+    // Collapse each card field into its final { key, fieldId, isNativeType, selectedOptionId }
+    // by layering the user's inline selection over the cardMeta default.
+    const selectedCardFields = (cardMeta.cardFields ?? []).map((cardField) => ({
+      ...cardField,
+      selectedOptionId:
+        stateValues[cardFieldBlockId(cardField.key)]?.[cardFieldActionId(cardField.key)]?.selected_option?.value
+        ?? cardField.defaultOptionId
+        ?? null,
+    }));
 
     const selectedLabelValues =
-      stateValues.card_labels?.card_labels_select?.selected_options?.map((o) => o.value) ??
-      stateValues.card_selections?.card_labels_select?.selected_options?.map((o) => o.value) ??
-      cardMeta.defaultLabelValues ??
-      [];
+      stateValues[CARD_LABELS_BLOCK_ID]?.[CARD_LABELS_ACTION_ID]?.selected_options?.map((option) => option.value)
+      ?? cardMeta.defaultLabelValues
+      ?? [];
 
-    const milestoneValue =
-      stateValues.card_milestone?.card_milestone_select?.selected_option?.value ??
-      cardMeta.defaultMilestoneValue ??
-      null;
+    const selectedMilestoneValue =
+      stateValues[CARD_MILESTONE_BLOCK_ID]?.[CARD_MILESTONE_ACTION_ID]?.selected_option?.value
+      ?? cardMeta.defaultMilestoneValue
+      ?? null;
 
     // Compile thread for the issue body
     let issueBody = cardMeta.messageText || "";
     if (cardMeta.threadTs) {
-      const threadMsgs = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs);
-      if (threadMsgs.length > 1) {
-        const threadContent = await compileThreadWithMeta(client, threadMsgs);
+      const threadMessages = await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs);
+      if (threadMessages.length > 1) {
+        const threadContent = await compileThreadWithMeta(client, threadMessages);
         if (threadContent) issueBody = threadContent;
       }
     }
@@ -1152,55 +1146,40 @@ export function registerHandlers(app, github) {
         title: issueTitle,
         body: issueBody,
         labels: selectedLabelValues.length > 0 ? selectedLabelValues : undefined,
-        milestone: milestoneValue && milestoneValue !== "" && milestoneValue !== "__none__" ? Number(milestoneValue) : undefined,
+        milestone:
+          selectedMilestoneValue && selectedMilestoneValue !== "" && selectedMilestoneValue !== CARD_MILESTONE_NONE_VALUE
+            ? Number(selectedMilestoneValue)
+            : undefined,
       });
 
-      // Set native issue type immediately after creation (independent of project)
-      if (cardMeta.isNativeType && typeOptionId) {
-        await github.setIssueType(createdIssue.node_id, typeOptionId);
+      // Native issue type is set via updateIssue (independent of any project).
+      const nativeTypeField = selectedCardFields.find(
+        (cardField) => cardField.isNativeType && cardField.selectedOptionId
+      );
+      if (nativeTypeField) {
+        await github.setIssueType(createdIssue.node_id, nativeTypeField.selectedOptionId);
       }
 
       if (cardMeta.projectId) {
-        const projectItemId = await github.addIssueToProject(cardMeta.projectId, createdIssue.node_id)
-          .catch((err) => { console.error("Failed to add card issue to project:", err.message); return null; });
+        const projectItemId = await github
+          .addIssueToProject(cardMeta.projectId, createdIssue.node_id)
+          .catch((err) => {
+            console.error("Failed to add card issue to project:", err?.message ?? err);
+            return null;
+          });
 
         if (projectItemId) {
-          const fieldUpdates = [];
-
-          if (!cardMeta.isNativeType && cardMeta.typeFieldId && typeOptionId) {
-            fieldUpdates.push(
-              github.setProjectField(
-                cardMeta.projectId,
-                projectItemId,
-                cardMeta.typeFieldId,
-                { singleSelectOptionId: typeOptionId }
-              ).catch((err) => console.error("Failed to set type:", err.message))
+          const projectFieldUpdates = selectedCardFields
+            .filter((cardField) => !cardField.isNativeType && cardField.fieldId && cardField.selectedOptionId)
+            .map((cardField) =>
+              github
+                .setProjectField(cardMeta.projectId, projectItemId, cardField.fieldId, {
+                  singleSelectOptionId: cardField.selectedOptionId,
+                })
+                .catch((err) => console.error(`Failed to set ${cardField.key}:`, err?.message ?? err))
             );
-          }
 
-          if (cardMeta.priorityFieldId && priorityOptionId) {
-            fieldUpdates.push(
-              github.setProjectField(
-                cardMeta.projectId,
-                projectItemId,
-                cardMeta.priorityFieldId,
-                { singleSelectOptionId: priorityOptionId }
-              ).catch((err) => console.error("Failed to set priority:", err.message))
-            );
-          }
-
-          if (cardMeta.statusFieldId && statusOptionId) {
-            fieldUpdates.push(
-              github.setProjectField(
-                cardMeta.projectId,
-                projectItemId,
-                cardMeta.statusFieldId,
-                { singleSelectOptionId: statusOptionId }
-              ).catch((err) => console.error("Failed to set status:", err.message))
-            );
-          }
-
-          await Promise.all(fieldUpdates);
+          await Promise.all(projectFieldUpdates);
         }
       }
 
@@ -1237,13 +1216,14 @@ export function registerHandlers(app, github) {
     const stateValues = body.state?.values ?? {};
 
     const currentLabelValues =
-      stateValues.card_labels?.card_labels_select?.selected_options?.map((o) => o.value) ??
-      stateValues.card_selections?.card_labels_select?.selected_options?.map((o) => o.value) ??
-      cardMeta.defaultLabelValues ?? [];
+      stateValues[CARD_LABELS_BLOCK_ID]?.[CARD_LABELS_ACTION_ID]?.selected_options?.map((option) => option.value)
+      ?? cardMeta.defaultLabelValues
+      ?? [];
 
     const currentMilestoneValue =
-      stateValues.card_milestone?.card_milestone_select?.selected_option?.value ??
-      cardMeta.defaultMilestoneValue ?? null;
+      stateValues[CARD_MILESTONE_BLOCK_ID]?.[CARD_MILESTONE_ACTION_ID]?.selected_option?.value
+      ?? cardMeta.defaultMilestoneValue
+      ?? null;
 
     const [repoOptions, labels, milestones, projects, projectFields] = await Promise.all([
       github.getRepos(),
@@ -1263,7 +1243,8 @@ export function registerHandlers(app, github) {
       projectFieldMap: buildProjectFieldMap(projectFields),
     };
 
-    const currentTitle = stateValues.card_title_block?.card_title_input?.value?.trim() || cardMeta.title;
+    const currentTitle =
+      stateValues[CARD_TITLE_BLOCK_ID]?.[CARD_TITLE_ACTION_ID]?.value?.trim() || cardMeta.title;
 
     await client.views.open({
       trigger_id: body.trigger_id,
