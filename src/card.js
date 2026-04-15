@@ -15,10 +15,97 @@ import { toSlackOption } from "./modal.js";
 const MAX_SELECT_OPTIONS = 100;
 const MAX_BUTTON_VALUE_CHARS = 2000;
 
+// Prominent single-select fields rendered as card accessories.
+// Order here is the display order on the card. Adding a new prominent card
+// field is a one-line change: give it a key, a label, a project-field name
+// matcher, and a default-option matcher (or null for "first option").
+const CARD_FIELD_SPECS = [
+  { key: "type",     label: "Type",     fieldNameMatcher: /^type$/i,   defaultOptionMatcher: null },
+  { key: "priority", label: "Priority", fieldNameMatcher: /priority/i, defaultOptionMatcher: /high|p0/i },
+  { key: "severity", label: "Severity", fieldNameMatcher: /severity/i, defaultOptionMatcher: /^s3|minor/i },
+  { key: "status",   label: "Status",   fieldNameMatcher: /status/i,   defaultOptionMatcher: /backlog/i },
+];
+
+// Returns `card_<key>` / `card_<key>_select` — the stable IDs used for the
+// inline Slack block, its action, and the no-op `^card_` action matcher.
+export function cardFieldBlockId(cardFieldKey) {
+  return `card_${cardFieldKey}`;
+}
+export function cardFieldActionId(cardFieldKey) {
+  return `${cardFieldBlockId(cardFieldKey)}_select`;
+}
+
+// Stable IDs for the non-single-select card blocks (title, labels, milestone).
+// Handlers reference these when reading back the user's inline selections; the
+// card builder uses them when emitting the blocks. Keeping them here ensures
+// both sides stay in sync.
+export const CARD_TITLE_BLOCK_ID = "card_title_block";
+export const CARD_TITLE_ACTION_ID = "card_title_input";
+export const CARD_LABELS_BLOCK_ID = "card_labels";
+export const CARD_LABELS_ACTION_ID = "card_labels_select";
+export const CARD_MILESTONE_BLOCK_ID = "card_milestone";
+export const CARD_MILESTONE_ACTION_ID = "card_milestone_select";
+export const CARD_MILESTONE_NONE_VALUE = "__none__";
+
 function takeOptions(items, limit = MAX_SELECT_OPTIONS) {
   return Array.isArray(items) ? items.slice(0, limit) : [];
 }
 
+function pickDefaultOption(options, defaultOptionMatcher) {
+  if (!Array.isArray(options) || options.length === 0) return null;
+  if (defaultOptionMatcher) {
+    return options.find((option) => defaultOptionMatcher.test(option?.name ?? "")) ?? options[0];
+  }
+  return options[0];
+}
+
+// Resolve CARD_FIELD_SPECS against the project's fields (and native org-level
+// issue types for the "type" slot). A project field named "Type" takes
+// precedence over native issue types; if no Type project field exists, the
+// native issue types (if any) populate the Type slot instead.
+//
+// Returns an array of resolved card fields ready for rendering and persistence:
+//   { key, label, fieldId, isNativeType, options, defaultOptionId }
+export function resolveCardFields(projectFields = [], nativeIssueTypes = []) {
+  const resolvedCardFields = [];
+
+  for (const spec of CARD_FIELD_SPECS) {
+    const matchingProjectField = projectFields.find((field) =>
+      spec.fieldNameMatcher.test(field?.name ?? "")
+    );
+
+    if (matchingProjectField?.options?.length > 0) {
+      resolvedCardFields.push({
+        key: spec.key,
+        label: spec.label,
+        fieldId: matchingProjectField.id ?? null,
+        isNativeType: false,
+        options: matchingProjectField.options,
+        defaultOptionId: pickDefaultOption(matchingProjectField.options, spec.defaultOptionMatcher)?.id ?? null,
+      });
+      continue;
+    }
+
+    if (spec.key === "type" && nativeIssueTypes?.length > 0) {
+      resolvedCardFields.push({
+        key: spec.key,
+        label: spec.label,
+        fieldId: null,
+        isNativeType: true,
+        options: nativeIssueTypes,
+        defaultOptionId: pickDefaultOption(nativeIssueTypes, spec.defaultOptionMatcher)?.id ?? null,
+      });
+    }
+  }
+
+  return resolvedCardFields;
+}
+
+// Truncate cardMeta fields progressively so its JSON fits under Slack's 2000-char
+// button value limit. Drops non-essential data first (extra labels, permalink,
+// body text), then truncates title last. Serialized length is cached and only
+// recomputed after each mutation to avoid repeatedly stringifying the whole
+// object.
 function fitCardMeta(cardMeta) {
   const fitted = { ...cardMeta };
 
@@ -26,31 +113,59 @@ function fitCardMeta(cardMeta) {
     fitted.defaultLabelValues = [...cardMeta.defaultLabelValues];
   }
 
+  let serializedLength = JSON.stringify(fitted).length;
+  const isOverLimit = () => serializedLength > MAX_BUTTON_VALUE_CHARS;
+  const remeasure = () => { serializedLength = JSON.stringify(fitted).length; };
+
   while (
-    JSON.stringify(fitted).length > MAX_BUTTON_VALUE_CHARS &&
+    isOverLimit() &&
     Array.isArray(fitted.defaultLabelValues) &&
     fitted.defaultLabelValues.length > 0
   ) {
     fitted.defaultLabelValues.pop();
+    remeasure();
   }
 
-  if (JSON.stringify(fitted).length > MAX_BUTTON_VALUE_CHARS) {
+  if (isOverLimit()) {
     fitted.permalink = "";
+    remeasure();
   }
 
-  if (JSON.stringify(fitted).length > MAX_BUTTON_VALUE_CHARS) {
+  if (isOverLimit()) {
     fitted.messageText = String(fitted.messageText ?? "").slice(0, 100);
+    remeasure();
   }
 
-  if (JSON.stringify(fitted).length > MAX_BUTTON_VALUE_CHARS) {
+  if (isOverLimit()) {
     fitted.messageText = "";
+    remeasure();
   }
 
-  if (JSON.stringify(fitted).length > MAX_BUTTON_VALUE_CHARS) {
+  if (isOverLimit()) {
     fitted.title = String(fitted.title ?? "").slice(0, 100);
   }
 
   return fitted;
+}
+
+function buildCardSingleSelectBlock(cardField) {
+  const cappedOptions = takeOptions(cardField.options);
+  if (cappedOptions.length === 0) return null;
+
+  const defaultOption = cappedOptions.find((option) => option.id === cardField.defaultOptionId);
+
+  return {
+    type: "section",
+    block_id: cardFieldBlockId(cardField.key),
+    text: { type: "mrkdwn", text: `*${cardField.label}*` },
+    accessory: {
+      type: "static_select",
+      action_id: cardFieldActionId(cardField.key),
+      placeholder: { type: "plain_text", text: cardField.label },
+      options: cappedOptions.map((option) => toSlackOption(option.name, option.id)),
+      ...(defaultOption ? { initial_option: toSlackOption(defaultOption.name, defaultOption.id) } : {}),
+    },
+  };
 }
 
 export function buildIssueCard({
@@ -58,145 +173,76 @@ export function buildIssueCard({
   title,
   labels = [],
   milestones = [],
-  priorityField = null,
-  statusField = null,
-  typeField = null,
+  cardFields = [],
   defaultLabelValues = [],
   defaultMilestoneValue = null,
   cardMeta,
 }) {
-  const safePriorityOptions = takeOptions(priorityField?.options);
-  const safeStatusOptions = takeOptions(statusField?.options);
-  const safeLabels = takeOptions(labels);
-  const safeMilestones = takeOptions(milestones, MAX_SELECT_OPTIONS - 1);
-  const safeCardMeta = fitCardMeta(cardMeta);
+  const cappedLabels = takeOptions(labels);
+  const cappedMilestones = takeOptions(milestones, MAX_SELECT_OPTIONS - 1);
+  const fittedCardMeta = fitCardMeta(cardMeta);
 
   const blocks = [
     {
       type: "section",
       block_id: "card_intro",
-      text: {
-        type: "mrkdwn",
-        text: `*New issue in ${repo}*`,
-      },
+      text: { type: "mrkdwn", text: `*New issue in ${repo}*` },
     },
     {
       type: "input",
-      block_id: "card_title_block",
+      block_id: CARD_TITLE_BLOCK_ID,
       optional: true,
       label: { type: "plain_text", text: "Issue title" },
       element: {
         type: "plain_text_input",
-        action_id: "card_title_input",
+        action_id: CARD_TITLE_ACTION_ID,
         initial_value: title || "",
         placeholder: { type: "plain_text", text: "Brief summary" },
       },
     },
   ];
 
-  const safeTypeOptions = takeOptions(typeField?.options);
-
-  if (safeTypeOptions.length > 0) {
-    blocks.push({
-      type: "section",
-      block_id: "card_type",
-      text: {
-        type: "mrkdwn",
-        text: "*Type*",
-      },
-      accessory: {
-        type: "static_select",
-        action_id: "card_type_select",
-        placeholder: { type: "plain_text", text: "Type" },
-        options: safeTypeOptions.map((o) => toSlackOption(o.name, o.id)),
-      },
-    });
+  for (const cardField of cardFields) {
+    const cardFieldBlock = buildCardSingleSelectBlock(cardField);
+    if (cardFieldBlock) blocks.push(cardFieldBlock);
   }
 
-  if (safePriorityOptions.length > 0) {
-    const defaultOpt =
-      safePriorityOptions.find((o) => /high|p0/i.test(o.name)) ?? safePriorityOptions[0];
+  if (cappedLabels.length > 0) {
+    const preSelectedLabels = cappedLabels.filter((label) => defaultLabelValues.includes(label.value));
 
     blocks.push({
       type: "section",
-      block_id: "card_priority",
-      text: {
-        type: "mrkdwn",
-        text: "*Priority*",
-      },
-      accessory: {
-        type: "static_select",
-        action_id: "card_priority_select",
-        placeholder: { type: "plain_text", text: "Priority" },
-        initial_option: toSlackOption(defaultOpt.name, defaultOpt.id),
-        options: safePriorityOptions.map((o) => toSlackOption(o.name, o.id)),
-      },
-    });
-  }
-
-  if (safeStatusOptions.length > 0) {
-    const defaultOpt =
-      safeStatusOptions.find((o) => /backlog/i.test(o.name)) ?? safeStatusOptions[0];
-
-    blocks.push({
-      type: "section",
-      block_id: "card_status",
-      text: {
-        type: "mrkdwn",
-        text: "*Status*",
-      },
-      accessory: {
-        type: "static_select",
-        action_id: "card_status_select",
-        placeholder: { type: "plain_text", text: "Status" },
-        initial_option: toSlackOption(defaultOpt.name, defaultOpt.id),
-        options: safeStatusOptions.map((o) => toSlackOption(o.name, o.id)),
-      },
-    });
-  }
-
-  if (safeLabels.length > 0) {
-    const preSelected = safeLabels.filter((l) => defaultLabelValues.includes(l.value));
-
-    blocks.push({
-      type: "section",
-      block_id: "card_labels",
-      text: {
-        type: "mrkdwn",
-        text: "*Labels*",
-      },
+      block_id: CARD_LABELS_BLOCK_ID,
+      text: { type: "mrkdwn", text: "*Labels*" },
       accessory: {
         type: "multi_static_select",
-        action_id: "card_labels_select",
+        action_id: CARD_LABELS_ACTION_ID,
         placeholder: { type: "plain_text", text: "Labels" },
-        options: safeLabels.map((l) => toSlackOption(l.text, l.value)),
-        ...(preSelected.length > 0
-          ? { initial_options: preSelected.map((l) => toSlackOption(l.text, l.value)) }
+        options: cappedLabels.map((label) => toSlackOption(label.text, label.value)),
+        ...(preSelectedLabels.length > 0
+          ? { initial_options: preSelectedLabels.map((label) => toSlackOption(label.text, label.value)) }
           : {}),
       },
     });
   }
 
-  if (safeMilestones.length > 0) {
-    const preSelected = safeMilestones.find((m) => m.value === defaultMilestoneValue);
+  if (cappedMilestones.length > 0) {
+    const preSelectedMilestone = cappedMilestones.find((milestone) => milestone.value === defaultMilestoneValue);
 
     blocks.push({
       type: "section",
-      block_id: "card_milestone",
-      text: {
-        type: "mrkdwn",
-        text: "*Milestone*",
-      },
+      block_id: CARD_MILESTONE_BLOCK_ID,
+      text: { type: "mrkdwn", text: "*Milestone*" },
       accessory: {
         type: "static_select",
-        action_id: "card_milestone_select",
+        action_id: CARD_MILESTONE_ACTION_ID,
         placeholder: { type: "plain_text", text: "Milestone (optional)" },
         options: [
-          toSlackOption("No milestone", "__none__"),
-          ...safeMilestones.map((m) => toSlackOption(m.text, m.value)),
+          toSlackOption("No milestone", CARD_MILESTONE_NONE_VALUE),
+          ...cappedMilestones.map((milestone) => toSlackOption(milestone.text, milestone.value)),
         ],
-        ...(preSelected
-          ? { initial_option: toSlackOption(preSelected.text, preSelected.value) }
+        ...(preSelectedMilestone
+          ? { initial_option: toSlackOption(preSelectedMilestone.text, preSelectedMilestone.value) }
           : {}),
       },
     });
@@ -213,20 +259,20 @@ export function buildIssueCard({
           text: { type: "plain_text", text: "Create Issue" },
           action_id: "issue_card_create",
           style: "primary",
-          value: JSON.stringify(safeCardMeta),
+          value: JSON.stringify(fittedCardMeta),
         },
         {
           type: "button",
           text: { type: "plain_text", text: "Customize" },
           action_id: "issue_card_customize",
-          value: JSON.stringify(safeCardMeta),
+          value: JSON.stringify(fittedCardMeta),
         },
         {
           type: "button",
           text: { type: "plain_text", text: "Cancel" },
           action_id: "issue_card_cancel",
           style: "danger",
-          value: JSON.stringify({ threadTs: safeCardMeta.threadTs }),
+          value: JSON.stringify({ threadTs: fittedCardMeta.threadTs }),
         },
       ],
     }
@@ -239,7 +285,9 @@ export function buildIssueCard({
 // Slack button values are limited to 2000 chars — keep this lean:
 //   - messageText capped at 200 chars (thread content is re-fetched on submit)
 //   - title capped at 150 chars
-//   - option IDs stored as scalar defaults, not as full name→ID maps
+//   - cardFields stores only the minimal data needed to apply selections:
+//     { key, fieldId, isNativeType, defaultOptionId }. blockId / actionId are
+//     derivable from key via cardFieldBlockId() / cardFieldActionId().
 export function buildCardMeta({
   repo,
   title,
@@ -249,10 +297,7 @@ export function buildCardMeta({
   userId,
   permalink = "",
   projectId = null,
-  priorityField = null,
-  statusField = null,
-  typeField = null,
-  isNativeType = false,
+  cardFields = [],
   defaultLabelValues = [],
   defaultMilestoneValue = null,
 }) {
@@ -265,19 +310,12 @@ export function buildCardMeta({
     userId,
     permalink,
     projectId,
-    priorityFieldId: priorityField?.id ?? null,
-    defaultPriorityOptionId:
-      priorityField?.options?.find((o) => /high|p0/i.test(o.name))?.id ??
-      priorityField?.options?.[0]?.id ??
-      null,
-    statusFieldId: statusField?.id ?? null,
-    defaultStatusOptionId:
-      statusField?.options?.find((o) => /backlog/i.test(o.name))?.id ??
-      statusField?.options?.[0]?.id ??
-      null,
-    typeFieldId: typeField?.id ?? null,
-    isNativeType: isNativeType || false,
-    defaultTypeOptionId: null,
+    cardFields: cardFields.map((cardField) => ({
+      key: cardField.key,
+      fieldId: cardField.fieldId,
+      isNativeType: cardField.isNativeType === true,
+      defaultOptionId: cardField.defaultOptionId ?? null,
+    })),
     defaultLabelValues,
     defaultMilestoneValue,
   };
