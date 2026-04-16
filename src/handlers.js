@@ -5,7 +5,7 @@ import {
   buildProjectFieldMap,
   resolveDefaultProjectId,
 } from "./modal.js";
-import { fetchThreadMessages, compileThreadWithMeta, deriveTitle } from "./thread.js";
+import { fetchThreadMessages, compileThreadWithMeta, deriveTitle, getOwnBotIdentity, extractMessageText } from "./thread.js";
 import {
   buildIssueCard,
   buildCardMeta,
@@ -451,10 +451,13 @@ export function registerHandlers(app, github) {
       let prevMessage = null;
 
       if (event.thread_ts) {
-        // In a thread: find the last non-bot message before this @mention
+        // In a thread: find the most recent message before this @mention,
+        // excluding only Butler's own posts. Other bots (e.g. Sentry) stay
+        // eligible so their alert content can seed the issue body.
         const threadMsgs = await fetchThreadMessages(client, event.channel, event.thread_ts);
+        const { botId: ownBotId } = await getOwnBotIdentity(client);
         prevMessage = [...threadMsgs]
-          .filter((m) => parseFloat(m.ts) < parseFloat(event.ts) && !m.bot_id)
+          .filter((m) => parseFloat(m.ts) < parseFloat(event.ts) && m.bot_id !== ownBotId)
           .sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts))[0] ?? null;
       } else {
         // Top-level: fetch the message immediately above in the channel
@@ -497,7 +500,7 @@ export function registerHandlers(app, github) {
         channelId: event.channel,
         threadTs,
         userId,
-        messageText: prevMessage.text ?? "",
+        messageText: extractMessageText(prevMessage),
         permalink: permalinkResult?.permalink ?? "",
         repo,
       }).catch(async (err) => {
@@ -717,7 +720,7 @@ export function registerHandlers(app, github) {
       channelId,
       threadTs,
       userId,
-      messageText: message.text ?? "",
+      messageText: extractMessageText(message),
       permalink: permalinkResult?.permalink ?? "",
       repo,
     }).catch(async (err) => {
