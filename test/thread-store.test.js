@@ -4,6 +4,7 @@ import {
   registerThreadIssue,
   getThreadIssue,
   updateThreadIssueSyncTs,
+  markParentIncluded,
   clearThreadIssueMap,
 } from "../src/thread-store.js";
 
@@ -53,5 +54,24 @@ describe("thread-store", () => {
     const entry = await getThreadIssue("3000.0");
     assert.equal(entry.repo, "new-repo");
     assert.equal(entry.issueNumber, 99);
+  });
+
+  test("parentIncluded defaults to false and persists when set", async () => {
+    await registerThreadIssue("4000.0", "repo", 5, "3500.0");
+    assert.equal((await getThreadIssue("4000.0")).parentIncluded, false);
+
+    await registerThreadIssue("4001.0", "repo", 6, "3500.0", true);
+    assert.equal((await getThreadIssue("4001.0")).parentIncluded, true);
+  });
+
+  test("markParentIncluded flips the flag for known threadTs", async () => {
+    await registerThreadIssue("5000.0", "repo", 7, "4900.0");
+    assert.equal((await getThreadIssue("5000.0")).parentIncluded, false);
+    await markParentIncluded("5000.0");
+    assert.equal((await getThreadIssue("5000.0")).parentIncluded, true);
+  });
+
+  test("markParentIncluded is a no-op for unknown threadTs", async () => {
+    await assert.doesNotReject(() => markParentIncluded("missing.0"));
   });
 });

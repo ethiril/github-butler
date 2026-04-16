@@ -50,9 +50,26 @@ function extractBlockText(block) {
 // Slack bot apps (Sentry, PagerDuty, etc.) typically post content in attachments
 // or blocks rather than in `message.text`. Falls back through these in priority
 // order so dumped threads include the alert body, not just an empty string.
+//
+// For bot messages specifically we prefer `blocks` over `attachments` / `text`:
+// modern alert apps put the full multi-line structured content in blocks and
+// only a short one-line summary in `attachments[].fallback`. Using that
+// summary as the issue body means the title ends up carrying the whole alert
+// and the body is empty. User messages keep the legacy text-first priority so
+// mentions/links decoded from `text` are preserved.
 export function extractMessageText(message) {
   if (!message) return "";
   if (message.subtype === "file_share") return "";
+
+  const isBot = Boolean(message.bot_id || message.bot_profile || message.subtype === "bot_message");
+
+  const blocksText = (message.blocks ?? [])
+    .map(extractBlockText)
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+
+  if (isBot && blocksText) return blocksText;
 
   const baseText = (message.text ?? "").trim();
   if (baseText) return baseText;
@@ -64,11 +81,7 @@ export function extractMessageText(message) {
     .trim();
   if (attachmentText) return attachmentText;
 
-  return (message.blocks ?? [])
-    .map(extractBlockText)
-    .filter(Boolean)
-    .join("\n\n")
-    .trim();
+  return blocksText;
 }
 
 export function compileThread(messages) {
@@ -153,9 +166,27 @@ async function decodeSlackText(text, userCache, client) {
     .replace(/<(https?:\/\/[^>]+)>/g, "$1");
 }
 
+function isBotMessage(message) {
+  return Boolean(message?.bot_id || message?.bot_profile || message?.subtype === "bot_message");
+}
+
+async function fetchMessagePermalink(client, channel, ts) {
+  if (!channel || !client?.chat?.getPermalink) return null;
+  const result = await client.chat.getPermalink({ channel, message_ts: ts }).catch(() => null);
+  return result?.permalink ?? null;
+}
+
 // Options:
-//   sinceTs — only include messages newer than this Slack ts (tag update flow)
-export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) {
+//   sinceTs       — only include messages newer than this Slack ts (tag update flow)
+//   includeParent — force the thread root (first non-Butler message) into the
+//                   output even if sinceTs would otherwise filter it out. Used
+//                   on the first tag-update after issue creation so the alert
+//                   content that started the thread (e.g. a Sentry message)
+//                   gets captured into the ticket.
+//   channel       — Slack channel id; when supplied, bot messages with no
+//                   extractable content render a placeholder pointing back to
+//                   the Slack message via chat.getPermalink.
+export async function compileThreadWithMeta(client, messages, { sinceTs, includeParent, channel } = {}) {
   // Exclude only Butler's own messages (its "Issue created" / "Thread update added"
   // confirmations). Other bots like Sentry carry the actual thread context and
   // must be preserved. If auth.test is unavailable, skip filtering entirely.
@@ -164,9 +195,15 @@ export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) 
     ? messages.filter((message) => message.bot_id !== ownBotId)
     : messages;
 
-  const filteredMessages = sinceTs
-    ? nonOwnMessages.filter((message) => parseFloat(message.ts) > parseFloat(sinceTs))
-    : nonOwnMessages;
+  let filteredMessages;
+  if (sinceTs) {
+    filteredMessages = nonOwnMessages.filter((message) => parseFloat(message.ts) > parseFloat(sinceTs));
+    if (includeParent && nonOwnMessages[0] && !filteredMessages.some((m) => m.ts === nonOwnMessages[0].ts)) {
+      filteredMessages = [nonOwnMessages[0], ...filteredMessages];
+    }
+  } else {
+    filteredMessages = nonOwnMessages;
+  }
 
   if (filteredMessages.length === 0) return "";
 
@@ -190,10 +227,20 @@ export async function compileThreadWithMeta(client, messages, { sinceTs } = {}) 
         .filter((file) => file.mimetype?.startsWith("image/"))
         .map((file) => `[${file.name ?? "image"}](${file.permalink ?? ""})`);
 
-      if (!text && imageLinks.length === 0) return null;
-
       const author = await resolveMessageDisplayName(client, userCache, message);
       const timestamp = formatSlackTimestamp(message.ts);
+
+      if (!text && imageLinks.length === 0) {
+        // Bot apps (Sentry, PagerDuty, …) sometimes post content in block types
+        // we don't yet parse. Emit a placeholder pointing back to Slack rather
+        // than dropping the message entirely.
+        if (!isBotMessage(message)) return null;
+        const permalink = await fetchMessagePermalink(client, channel, message.ts);
+        const linkText = permalink
+          ? `[${author} message — view in Slack](${permalink})`
+          : `${author} message`;
+        return `**${author}** · ${timestamp}\n> _${linkText}_`;
+      }
 
       const quotedLines = [];
       if (text) quotedLines.push(`> ${text.replace(/\n/g, "\n> ")}`);
@@ -211,4 +258,68 @@ export function deriveTitle(messageText) {
   const firstLine = (messageText ?? "").split("\n")[0].trim();
   if (!firstLine) return "Issue from Slack";
   return firstLine.length <= 80 ? firstLine : firstLine.slice(0, 77) + "...";
+}
+
+// Parses alert-bot messages (Sentry, PagerDuty, …) into a concise title like
+// "[Dev][Sentry] SplitClient is null". Walks the message's blocks to find:
+//   - the environment (from a context element matching "environment: <name>")
+//   - the error summary (first section whose text is a single backticked code
+//     snippet; else first section that isn't a bare Slack URL link)
+// Returns null when the message isn't a bot alert, has no blocks, or we can't
+// extract an error summary — callers should fall back to deriveTitle().
+//
+// The source tag reflects bot_profile.name so PagerDuty alerts render as
+// "[PagerDuty]", not a hardcoded "[Sentry]". The environment prefix is dropped
+// entirely if no environment context is present.
+const MAX_ALERT_TITLE_LEN = 150;
+const BARE_SLACK_LINK_RE = /^(:[a-z0-9_+-]+:\s*)?<https?:\/\/[^>|]+(?:\|[^>]+)?>\s*$/i;
+
+export function deriveBotAlertTitle(message) {
+  if (!message) return null;
+  const botName = message?.bot_profile?.name;
+  if (!botName) return null;
+
+  const blocks = Array.isArray(message.blocks) ? message.blocks : [];
+  if (blocks.length === 0) return null;
+
+  let env = null;
+  for (const block of blocks) {
+    if (block?.type !== "context") continue;
+    for (const element of block.elements ?? []) {
+      const match = (element?.text ?? "").match(/environment:\s*`?([A-Za-z0-9_-]+)`?/i);
+      if (match) { env = match[1]; break; }
+    }
+    if (env) break;
+  }
+
+  let errorLine = null;
+  for (const block of blocks) {
+    if (block?.type !== "section") continue;
+    const raw = (block?.text?.text ?? "").trim();
+    const codeMatch = raw.match(/^`([^`]+)`$/);
+    if (codeMatch) { errorLine = codeMatch[1].trim(); break; }
+  }
+
+  if (!errorLine) {
+    for (const block of blocks) {
+      if (block?.type !== "section") continue;
+      const raw = (block?.text?.text ?? "").trim();
+      if (!raw) continue;
+      if (BARE_SLACK_LINK_RE.test(raw)) continue;
+      errorLine = raw
+        .replace(/<https?:\/\/[^|>]+\|([^>]+)>/g, "$1")
+        .replace(/<(https?:\/\/[^>]+)>/g, "$1")
+        .replace(/\s+/g, " ")
+        .trim();
+      break;
+    }
+  }
+
+  if (!errorLine) return null;
+
+  const envLabel = env ? env[0].toUpperCase() + env.slice(1).toLowerCase() : null;
+  const prefix = envLabel ? `[${envLabel}][${botName}] ` : `[${botName}] `;
+  const room = Math.max(10, MAX_ALERT_TITLE_LEN - prefix.length);
+  const trimmed = errorLine.length > room ? errorLine.slice(0, room - 3) + "..." : errorLine;
+  return prefix + trimmed;
 }

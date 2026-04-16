@@ -306,6 +306,8 @@ export function buildCardMeta({
   cardFields = [],
   defaultLabelValues = [],
   defaultMilestoneValue = null,
+  parentIncluded = false,
+  seedTs = null,
 }) {
   return {
     repo,
@@ -324,5 +326,7 @@ export function buildCardMeta({
     })),
     defaultLabelValues,
     defaultMilestoneValue,
+    parentIncluded,
+    seedTs,
   };
 }

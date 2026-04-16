@@ -5,7 +5,7 @@ import {
   buildProjectFieldMap,
   resolveDefaultProjectId,
 } from "./modal.js";
-import { fetchThreadMessages, compileThreadWithMeta, deriveTitle, getOwnBotIdentity, extractMessageText } from "./thread.js";
+import { fetchThreadMessages, compileThreadWithMeta, deriveTitle, deriveBotAlertTitle, getOwnBotIdentity, extractMessageText } from "./thread.js";
 import {
   buildIssueCard,
   buildCardMeta,
@@ -20,7 +20,7 @@ import {
   CARD_MILESTONE_ACTION_ID,
   CARD_MILESTONE_NONE_VALUE,
 } from "./card.js";
-import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs, claimCardPost, releaseCardPost } from "./thread-store.js";
+import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs, markParentIncluded, claimCardPost, releaseCardPost } from "./thread-store.js";
 
 // Deduplication: prevents duplicate modal opens or issue creations from Lambda
 // retries or rapid double-clicks. Keyed on action_ts (actions/shortcuts) or
@@ -51,9 +51,14 @@ function safeErrorMessage(err) {
 }
 
 async function appendThreadUpdateToIssue(client, github, { channelId, threadTs, userId, existingIssue }) {
-  const { repo: issueRepo, issueNumber, lastSyncedTs } = existingIssue;
+  const { repo: issueRepo, issueNumber, lastSyncedTs, parentIncluded } = existingIssue;
   const allMessages = await fetchThreadMessages(client, channelId, threadTs);
-  const newContent = await compileThreadWithMeta(client, allMessages, { sinceTs: lastSyncedTs });
+  const includeParent = !parentIncluded;
+  const newContent = await compileThreadWithMeta(client, allMessages, {
+    sinceTs: lastSyncedTs,
+    includeParent,
+    channel: channelId,
+  });
 
   if (!newContent) {
     await client.chat.postEphemeral({
@@ -74,6 +79,7 @@ async function appendThreadUpdateToIssue(client, github, { channelId, threadTs, 
       `${newContent}\n\n---\n_Updated from Slack_`
     );
     await updateThreadIssueSyncTs(threadTs, latestTs);
+    if (includeParent) await markParentIncluded(threadTs).catch(() => {});
     await client.chat.postMessage({
       channel: channelId,
       thread_ts: threadTs,
@@ -151,7 +157,7 @@ function getRepoDefaultLabels(repo) {
   }
 }
 
-async function postIssueCard({ client, github, channelId, threadTs, userId, messageText, permalink, repo }) {
+async function postIssueCard({ client, github, channelId, threadTs, userId, messageText, permalink, repo, parentIncluded = false, seedTs = null, seedMessage = null }) {
   const userDefaults = getUserDefaults(userId);
 
   const [labels, milestones, allProjects] = await Promise.all([
@@ -177,9 +183,14 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     `[postIssueCard] cardFields: ${cardFields.map((field) => `${field.key}(${field.options.length}${field.isNativeType ? ",native" : ""})`).join(", ") || "none"}`
   );
 
-  const title = deriveTitle(messageText);
-  // Use lines after the first as the body; avoids duplicating the title in the body
-  const bodyLinesAfterTitle = messageText.split("\n").slice(1).join("\n").trim();
+  // Bot alerts (Sentry/PagerDuty/…) get a structured title like "[Dev][Sentry]
+  // SplitClient is null". When that path succeeds we keep the full extracted
+  // text as the body since the title no longer came from line 1.
+  const botAlertTitle = seedMessage ? deriveBotAlertTitle(seedMessage) : null;
+  const title = botAlertTitle ?? deriveTitle(messageText);
+  const bodyLinesAfterTitle = botAlertTitle
+    ? messageText.trim()
+    : messageText.split("\n").slice(1).join("\n").trim();
 
   // Repo-level label defaults take priority over per-user saved defaults.
   // Label names from the env are matched against the fetched label list to get their values.
@@ -200,6 +211,8 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     cardFields,
     defaultLabelValues,
     defaultMilestoneValue: userDefaults.milestoneValue ?? null,
+    parentIncluded,
+    seedTs,
   });
 
   const blocks = buildIssueCard({
@@ -275,6 +288,7 @@ export function registerHandlers(app, github) {
       userId,
       permalink: permalinkResult?.permalink ?? "",
       projectFieldMap: {},
+      parentIncluded: messageTs === threadTs,
     };
 
     const repoOptions = await github.getRepos();
@@ -381,6 +395,7 @@ export function registerHandlers(app, github) {
           userId,
           permalink: "",
           projectFieldMap: {},
+          parentIncluded: false,
         },
         repoOptions,
       }),
@@ -503,6 +518,9 @@ export function registerHandlers(app, github) {
         messageText: extractMessageText(prevMessage),
         permalink: permalinkResult?.permalink ?? "",
         repo,
+        parentIncluded: prevMessage.ts === threadTs,
+        seedTs: prevMessage.ts,
+        seedMessage: prevMessage,
       }).catch(async (err) => {
         console.error("Failed to post issue card from caret mention:", err);
         // Release the claim on failure so the user can try again
@@ -527,6 +545,7 @@ export function registerHandlers(app, github) {
       userId: event.user,
       permalink: "",
       projectFieldMap: {},
+      parentIncluded: false,
     };
 
     await client.chat.postEphemeral({
@@ -723,6 +742,9 @@ export function registerHandlers(app, github) {
       messageText: extractMessageText(message),
       permalink: permalinkResult?.permalink ?? "",
       repo,
+      parentIncluded: messageTs === threadTs,
+      seedTs: messageTs,
+      seedMessage: message,
     }).catch(async (err) => {
       console.error("Failed to post issue card:", err);
       // Release the claim on failure so the user can react again
@@ -1028,7 +1050,11 @@ export function registerHandlers(app, github) {
         const latestTs = threadMsgs.length > 0
           ? threadMsgs[threadMsgs.length - 1].ts
           : slackMessageContext.threadTs;
-        await registerThreadIssue(slackMessageContext.threadTs, selectedRepo, createdIssue.number, latestTs);
+        const parentIncluded =
+          slackMessageContext.parentIncluded === true
+          || includeThread
+          || (slackMessageContext.messageTs != null && slackMessageContext.messageTs === slackMessageContext.threadTs);
+        await registerThreadIssue(slackMessageContext.threadTs, selectedRepo, createdIssue.number, latestTs, parentIncluded);
       }
 
       await client.chat.postMessage({
@@ -1141,11 +1167,51 @@ export function registerHandlers(app, github) {
       ?? cardMeta.defaultMilestoneValue
       ?? null;
 
-    // Issue body is just the single target message. Thread context is opt-in
-    // via a subsequent tag update (butler emoji reaction or @mention with ^).
-    // Auto-pulling the thread here would include messages posted after the
-    // user's request and the bot's own card messages, producing spam.
+    // Re-fetch the full thread live instead of trusting cardMeta.messageText:
+    // fitCardMeta may have truncated or dropped that field to keep the button
+    // value under Slack's 2000-char limit, which would leave the issue body
+    // empty for bot alerts (Sentry etc.) with long extracted content. We also
+    // need the non-seed messages so any replies that existed at creation time
+    // get folded into the issue body (compileThreadWithMeta filters out
+    // Butler's own messages, so the card post itself is excluded).
+    const allThreadMessages = (cardMeta.seedTs && cardMeta.channelId && cardMeta.threadTs)
+      ? await fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs).catch(() => [])
+      : [];
+    const liveSeed = cardMeta.seedTs
+      ? allThreadMessages.find((m) => m.ts === cardMeta.seedTs) ?? null
+      : null;
+
+    let issueTitleFinal = issueTitle;
     let issueBody = cardMeta.messageText || "";
+    if (liveSeed) {
+      const liveText = extractMessageText(liveSeed);
+      if (liveText) {
+        const userTypedTitle = stateValues[CARD_TITLE_BLOCK_ID]?.[CARD_TITLE_ACTION_ID]?.value?.trim();
+        const botAlertTitle = deriveBotAlertTitle(liveSeed);
+        if (botAlertTitle) {
+          if (!userTypedTitle) issueTitleFinal = botAlertTitle;
+          // Title is synthesised separately from the body, so keep the full
+          // extracted content in the body rather than dropping the first line.
+          issueBody = liveText.trim();
+        } else {
+          const liveLines = liveText.split("\n");
+          const liveBody = liveLines.slice(1).join("\n").trim();
+          if (!userTypedTitle) issueTitleFinal = liveLines[0].trim() || issueTitleFinal;
+          if (liveBody) issueBody = liveBody;
+        }
+      }
+    }
+
+    if (cardMeta.seedTs && allThreadMessages.length > 1) {
+      const otherMessages = allThreadMessages.filter((m) => m.ts !== cardMeta.seedTs);
+      const otherThreadContent = await compileThreadWithMeta(client, otherMessages, {
+        channel: cardMeta.channelId,
+      });
+      if (otherThreadContent) {
+        issueBody = issueBody ? `${issueBody}\n\n${otherThreadContent}` : otherThreadContent;
+      }
+    }
+
     if (cardMeta.permalink) {
       issueBody += `\n\n---\n_Created from Slack: ${cardMeta.permalink}_`;
     }
@@ -1153,7 +1219,7 @@ export function registerHandlers(app, github) {
     try {
       const createdIssue = await github.createIssue({
         repo: cardMeta.repo,
-        title: issueTitle,
+        title: issueTitleFinal,
         body: issueBody,
         labels: selectedLabelValues.length > 0 ? selectedLabelValues : undefined,
         milestone:
@@ -1201,12 +1267,12 @@ export function registerHandlers(app, github) {
         channel: cardMeta.channelId,
         ...(cardMeta.threadTs ? { thread_ts: cardMeta.threadTs } : {}),
         unfurl_links: false,
-        text: `Issue created: <${createdIssue.html_url}|${cardMeta.repo}#${createdIssue.number} -- ${issueTitle}>`,
+        text: `Issue created: <${createdIssue.html_url}|${cardMeta.repo}#${createdIssue.number} -- ${issueTitleFinal}>`,
       });
 
       if (cardMeta.threadTs) {
         const latestTs = confirmMsg?.ts ?? cardMeta.threadTs;
-        await registerThreadIssue(cardMeta.threadTs, cardMeta.repo, createdIssue.number, latestTs);
+        await registerThreadIssue(cardMeta.threadTs, cardMeta.repo, createdIssue.number, latestTs, cardMeta.parentIncluded === true);
       }
     } catch (err) {
       console.error("Card issue creation failed:", err);
@@ -1235,12 +1301,21 @@ export function registerHandlers(app, github) {
       ?? cardMeta.defaultMilestoneValue
       ?? null;
 
-    const [repoOptions, labels, milestones, projects, projectFields] = await Promise.all([
+    // Re-fetch the seed to fill the modal with the full body, since fitCardMeta
+    // may have truncated cardMeta.messageText to fit the card button value.
+    const liveSeedPromise = cardMeta.seedTs && cardMeta.channelId && cardMeta.threadTs
+      ? fetchThreadMessages(client, cardMeta.channelId, cardMeta.threadTs)
+          .then((msgs) => msgs.find((m) => m.ts === cardMeta.seedTs) ?? null)
+          .catch(() => null)
+      : Promise.resolve(null);
+
+    const [repoOptions, labels, milestones, projects, projectFields, liveSeed] = await Promise.all([
       github.getRepos(),
       github.getLabels(cardMeta.repo),
       github.getMilestones(cardMeta.repo),
       github.getProjects(),
       cardMeta.projectId ? github.getProjectFields(cardMeta.projectId).catch(() => []) : Promise.resolve([]),
+      liveSeedPromise,
     ]);
 
     const initialProjectFieldValues = collectCardProjectFieldValues(projectFields, stateValues, cardMeta);
@@ -1251,10 +1326,30 @@ export function registerHandlers(app, github) {
       userId: cardMeta.userId,
       permalink: cardMeta.permalink,
       projectFieldMap: buildProjectFieldMap(projectFields),
+      parentIncluded: cardMeta.parentIncluded === true,
     };
 
+    let liveTitleFromSeed = null;
+    let liveBodyFromSeed = null;
+    if (liveSeed) {
+      const liveText = extractMessageText(liveSeed);
+      if (liveText) {
+        const botAlertTitle = deriveBotAlertTitle(liveSeed);
+        if (botAlertTitle) {
+          liveTitleFromSeed = botAlertTitle;
+          liveBodyFromSeed = liveText.trim() || null;
+        } else {
+          const liveLines = liveText.split("\n");
+          liveTitleFromSeed = liveLines[0].trim() || null;
+          liveBodyFromSeed = liveLines.slice(1).join("\n").trim() || null;
+        }
+      }
+    }
+
     const currentTitle =
-      stateValues[CARD_TITLE_BLOCK_ID]?.[CARD_TITLE_ACTION_ID]?.value?.trim() || cardMeta.title;
+      stateValues[CARD_TITLE_BLOCK_ID]?.[CARD_TITLE_ACTION_ID]?.value?.trim()
+      || liveTitleFromSeed
+      || cardMeta.title;
 
     await client.views.open({
       trigger_id: body.trigger_id,
@@ -1262,7 +1357,7 @@ export function registerHandlers(app, github) {
         selectedRepo: cardMeta.repo,
         metadata: slackMessageContext,
         currentTitle,
-        currentBody: cardMeta.messageText,
+        currentBody: liveBodyFromSeed ?? cardMeta.messageText,
         labels,
         milestones,
         projects,
