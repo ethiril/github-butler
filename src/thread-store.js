@@ -98,9 +98,9 @@ export async function releaseCardPost(threadTs) {
   })).catch(() => {}); // Ignore if item doesn't exist or is a real issue
 }
 
-export async function registerThreadIssue(threadTs, repo, issueNumber, lastSyncedTs) {
+export async function registerThreadIssue(threadTs, repo, issueNumber, lastSyncedTs, parentIncluded = false) {
   if (!TABLE) {
-    memoryMap.set(threadTs, { repo, issueNumber, lastSyncedTs });
+    memoryMap.set(threadTs, { repo, issueNumber, lastSyncedTs, parentIncluded });
     return;
   }
 
@@ -108,7 +108,7 @@ export async function registerThreadIssue(threadTs, repo, issueNumber, lastSynce
   const db = await getDynamo();
   await db.send(new PutCommand({
     TableName: TABLE,
-    Item: { threadTs, repo, issueNumber, lastSyncedTs },
+    Item: { threadTs, repo, issueNumber, lastSyncedTs, parentIncluded },
   }));
 }
 
@@ -127,7 +127,7 @@ export async function getThreadIssue(threadTs) {
   // Ignore pending card claims — only return entries for actually-created issues.
   // claimCardPost shares this table/key and writes {threadTs, status: "card_pending"}.
   if (!item || item.status === "card_pending" || item.issueNumber == null) return null;
-  return item;
+  return { parentIncluded: false, ...item };
 }
 
 export async function updateThreadIssueSyncTs(threadTs, lastSyncedTs) {
@@ -144,6 +144,26 @@ export async function updateThreadIssueSyncTs(threadTs, lastSyncedTs) {
     Key: { threadTs },
     UpdateExpression: "SET lastSyncedTs = :ts",
     ExpressionAttributeValues: { ":ts": lastSyncedTs },
+  }));
+}
+
+// Mark the thread's parent/root message as having been included in the issue
+// (either in the initial body or in a prior thread-update comment). Prevents
+// subsequent tag-update comments from re-embedding the same parent content.
+export async function markParentIncluded(threadTs) {
+  if (!TABLE) {
+    const entry = memoryMap.get(threadTs);
+    if (entry) entry.parentIncluded = true;
+    return;
+  }
+
+  const { UpdateCommand } = await import("@aws-sdk/lib-dynamodb");
+  const db = await getDynamo();
+  await db.send(new UpdateCommand({
+    TableName: TABLE,
+    Key: { threadTs },
+    UpdateExpression: "SET parentIncluded = :t",
+    ExpressionAttributeValues: { ":t": true },
   }));
 }
 

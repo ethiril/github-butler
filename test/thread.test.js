@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { compileThread, compileThreadWithMeta, deriveTitle, extractMessageText } from "../src/thread.js";
+import { compileThread, compileThreadWithMeta, deriveTitle, deriveBotAlertTitle, extractMessageText } from "../src/thread.js";
 
 describe("compileThread", () => {
   test("returns empty string for empty array", () => {
@@ -216,6 +216,58 @@ describe("compileThreadWithMeta", () => {
     const result = await compileThreadWithMeta(client, messages);
     assert.ok(result.includes("Alert fired"));
   });
+
+  test("includeParent forces the thread root into output even when sinceTs filters it", async () => {
+    const messages = [
+      { ts: "1000.0", bot_id: "BSENTRY", bot_profile: { name: "Sentry" }, text: "Original alert" },
+      { ts: "2000.0", user: "U1", text: "new reply" },
+    ];
+    const client = makeClient({ U1: "Alice" }, { ownBotId: "BBUTLER" });
+    const result = await compileThreadWithMeta(client, messages, {
+      sinceTs: "1500.0",
+      includeParent: true,
+    });
+    assert.ok(result.includes("Original alert"));
+    assert.ok(result.includes("new reply"));
+  });
+
+  test("includeParent does not duplicate the parent when it is already after sinceTs", async () => {
+    const messages = [
+      { ts: "2000.0", bot_id: "BSENTRY", bot_profile: { name: "Sentry" }, text: "Original alert" },
+      { ts: "3000.0", user: "U1", text: "new reply" },
+    ];
+    const client = makeClient({ U1: "Alice" }, { ownBotId: "BBUTLER" });
+    const result = await compileThreadWithMeta(client, messages, {
+      sinceTs: "1500.0",
+      includeParent: true,
+    });
+    const occurrences = result.split("Original alert").length - 1;
+    assert.equal(occurrences, 1);
+  });
+
+  test("renders a placeholder with permalink when a bot message has no extractable text", async () => {
+    const messages = [
+      { ts: "1000.0", bot_id: "BSENTRY", bot_profile: { name: "Sentry" }, text: "" },
+    ];
+    const client = makeClient({}, { ownBotId: "BBUTLER" });
+    client.chat = {
+      getPermalink: async () => ({ permalink: "https://slack.test/p1000" }),
+    };
+    const result = await compileThreadWithMeta(client, messages, { channel: "C1" });
+    assert.ok(result.includes("Sentry"));
+    assert.ok(result.includes("https://slack.test/p1000"));
+    assert.ok(result.includes("view in Slack"));
+  });
+
+  test("bot placeholder falls back to plain text when no channel is supplied", async () => {
+    const messages = [
+      { ts: "1000.0", bot_id: "BSENTRY", bot_profile: { name: "Sentry" }, text: "" },
+    ];
+    const client = makeClient({}, { ownBotId: "BBUTLER" });
+    const result = await compileThreadWithMeta(client, messages);
+    assert.ok(result.includes("Sentry"));
+    assert.ok(result.includes("Sentry message"));
+  });
 });
 
 describe("extractMessageText", () => {
@@ -248,8 +300,131 @@ describe("extractMessageText", () => {
     assert.equal(extractMessageText(msg), "hello");
   });
 
+  test("prefers blocks over attachments for bot messages", () => {
+    const msg = {
+      bot_id: "BSENTRY",
+      bot_profile: { name: "Sentry" },
+      text: "",
+      attachments: [{ fallback: "[app] OneLineSummary" }],
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: "SignedOutException" } },
+        { type: "section", text: { type: "mrkdwn", text: "No user is currently signed in" } },
+      ],
+    };
+    const result = extractMessageText(msg);
+    assert.ok(result.includes("SignedOutException"));
+    assert.ok(result.includes("No user is currently signed in"));
+    assert.ok(!result.includes("OneLineSummary"));
+  });
+
+  test("keeps text-first priority for user messages when blocks also present", () => {
+    const msg = {
+      user: "U1",
+      text: "hello from user",
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: "rendered blocks" } }],
+    };
+    assert.equal(extractMessageText(msg), "hello from user");
+  });
+
   test("returns empty string when nothing is available", () => {
     assert.equal(extractMessageText({}), "");
     assert.equal(extractMessageText(null), "");
+  });
+});
+
+describe("deriveBotAlertTitle", () => {
+  function sentryMessage({ env = "dev", errorLine = "`SplitClient is null`", name = "Sentry", extraBlocks = [] } = {}) {
+    const blocks = [
+      { type: "section", text: { type: "mrkdwn", text: ":red_circle: <https://sentry.io/issues/1|String>" } },
+      { type: "section", text: { type: "mrkdwn", text: "<asynchronous suspension> in ?" } },
+      { type: "section", text: { type: "mrkdwn", text: errorLine } },
+      ...extraBlocks,
+      { type: "context", elements: [{ type: "mrkdwn", text: `environment: \`${env}\`` }] },
+    ];
+    return { bot_id: "BSENTRY", bot_profile: { name }, blocks };
+  }
+
+  test("returns null for user messages", () => {
+    assert.equal(deriveBotAlertTitle({ user: "U1", text: "hello" }), null);
+  });
+
+  test("returns null for bot messages with no blocks", () => {
+    assert.equal(deriveBotAlertTitle({ bot_profile: { name: "Sentry" }, text: "x" }), null);
+  });
+
+  test("formats [Env][Bot] <code block> for Sentry-style blocks", () => {
+    assert.equal(deriveBotAlertTitle(sentryMessage()), "[Dev][Sentry] SplitClient is null");
+  });
+
+  test("reflects bot_profile.name so PagerDuty renders as [PagerDuty]", () => {
+    assert.equal(
+      deriveBotAlertTitle(sentryMessage({ name: "PagerDuty", errorLine: "`Database unreachable`" })),
+      "[Dev][PagerDuty] Database unreachable"
+    );
+  });
+
+  test("drops the env prefix when no environment context is present", () => {
+    const msg = {
+      bot_profile: { name: "Sentry" },
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: ":red_circle: <https://sentry.io/issues/1|String>" } },
+        { type: "section", text: { type: "mrkdwn", text: "`SplitClient is null`" } },
+      ],
+    };
+    assert.equal(deriveBotAlertTitle(msg), "[Sentry] SplitClient is null");
+  });
+
+  test("title-cases the environment name", () => {
+    assert.equal(
+      deriveBotAlertTitle(sentryMessage({ env: "production" })),
+      "[Production][Sentry] SplitClient is null"
+    );
+  });
+
+  test("falls back to first non-link section text when no code block found", () => {
+    const msg = {
+      bot_profile: { name: "Sentry" },
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: ":red_circle: <https://sentry.io/issues/1|String>" } },
+        { type: "section", text: { type: "mrkdwn", text: "Something went wrong in production" } },
+        { type: "context", elements: [{ type: "mrkdwn", text: "environment: `dev`" }] },
+      ],
+    };
+    assert.equal(deriveBotAlertTitle(msg), "[Dev][Sentry] Something went wrong in production");
+  });
+
+  test("decodes Slack link syntax when using a section fallback", () => {
+    const msg = {
+      bot_profile: { name: "Sentry" },
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: ":red_circle: <https://sentry.io/issues/1|String>" } },
+        { type: "section", text: { type: "mrkdwn", text: "Failure in <https://example.com|service>" } },
+      ],
+    };
+    assert.equal(deriveBotAlertTitle(msg), "[Sentry] Failure in service");
+  });
+
+  test("returns null when no error line can be extracted", () => {
+    const msg = {
+      bot_profile: { name: "Sentry" },
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: ":red_circle: <https://sentry.io/issues/1|String>" } },
+      ],
+    };
+    assert.equal(deriveBotAlertTitle(msg), null);
+  });
+
+  test("truncates very long error lines to stay under 150 chars total", () => {
+    const longError = "a".repeat(400);
+    const msg = {
+      bot_profile: { name: "Sentry" },
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `\`${longError}\`` } },
+      ],
+    };
+    const result = deriveBotAlertTitle(msg);
+    assert.ok(result.startsWith("[Sentry] "));
+    assert.ok(result.length <= 150);
+    assert.ok(result.endsWith("..."));
   });
 });
