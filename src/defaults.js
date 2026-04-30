@@ -6,6 +6,7 @@ export function getUserDefaults(userId) {
     projectId: null,
     milestoneValue: null,
     labelValues: [],
+    assigneeLogins: [],
   };
 }
 

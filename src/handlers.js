@@ -19,6 +19,8 @@ import {
   CARD_MILESTONE_BLOCK_ID,
   CARD_MILESTONE_ACTION_ID,
   CARD_MILESTONE_NONE_VALUE,
+  CARD_ASSIGNEES_BLOCK_ID,
+  CARD_ASSIGNEES_ACTION_ID,
 } from "./card.js";
 import { registerThreadIssue, getThreadIssue, updateThreadIssueSyncTs, markParentIncluded, claimCardPost, releaseCardPost } from "./thread-store.js";
 
@@ -160,9 +162,10 @@ function getRepoDefaultLabels(repo) {
 async function postIssueCard({ client, github, channelId, threadTs, userId, messageText, permalink, repo, parentIncluded = false, seedTs = null, seedMessage = null }) {
   const userDefaults = getUserDefaults(userId);
 
-  const [labels, milestones, allProjects] = await Promise.all([
+  const [labels, milestones, assignees, allProjects] = await Promise.all([
     github.getLabels(repo),
     github.getMilestones(repo),
+    github.getAssignees(repo),
     github.getProjects(),
   ]);
 
@@ -199,6 +202,10 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     ? labels.filter((label) => repoLabelNames.includes(label.text)).map((label) => label.value)
     : (userDefaults.labelValues ?? []);
 
+  const defaultAssigneeLogins = (userDefaults.assigneeLogins ?? []).filter((login) =>
+    assignees.some((assignee) => assignee.value === login)
+  );
+
   const cardMeta = buildCardMeta({
     repo,
     title,
@@ -211,6 +218,7 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     cardFields,
     defaultLabelValues,
     defaultMilestoneValue: userDefaults.milestoneValue ?? null,
+    defaultAssigneeLogins,
     parentIncluded,
     seedTs,
   });
@@ -220,9 +228,11 @@ async function postIssueCard({ client, github, channelId, threadTs, userId, mess
     title,
     labels,
     milestones,
+    assignees,
     cardFields,
     defaultLabelValues,
     defaultMilestoneValue: userDefaults.milestoneValue ?? null,
+    defaultAssigneeLogins,
     cardMeta,
   });
 
@@ -461,6 +471,19 @@ export function registerHandlers(app, github) {
 
       if (repoOverride) {
         console.log(`[mention/caret] using repo override: ${repoOverride}`);
+      }
+
+      // Check repo existence before claiming the thread. getLabels/getMilestones
+      // swallow 404s, so without this a typo produces a bogus card and leaves a
+      // stale claim that blocks any retry (reaction or tag) on this thread.
+      if (!(await github.repoExists(repo))) {
+        await client.chat.postEphemeral({
+          channel: event.channel,
+          user: userId,
+          thread_ts: threadTs,
+          text: `Repo *${repo}* not found under ${process.env.GITHUB_OWNER}. Check the spelling and try again.`,
+        });
+        return;
       }
 
       let prevMessage = null;
@@ -720,6 +743,19 @@ export function registerHandlers(app, github) {
       return;
     }
 
+    // Check repo existence before claiming the thread. getLabels/getMilestones
+    // swallow 404s, so without this a mis-named emoji produces a bogus card and
+    // leaves a stale claim that blocks any retry (mention or tag) on this thread.
+    if (!(await github.repoExists(repo))) {
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: userId,
+        thread_ts: threadTs,
+        text: `Repo *${repo}* not found under ${process.env.GITHUB_OWNER}. Check the spelling and try again.`,
+      });
+      return;
+    }
+
     // Cross-instance dedup: claim the card post in DynamoDB / in-memory.
     // If another Lambda instance already claimed it, bail out silently.
     const claimed = await claimCardPost(threadTs).catch(() => true); // on error, proceed
@@ -774,10 +810,11 @@ export function registerHandlers(app, github) {
     const currentProjectFieldValues = collectModalProjectFieldValues(modalView.state.values);
     const defaults = getUserDefaults(body.user?.id);
 
-    const [repoOptions, labels, milestones, projects, templates] = await Promise.all([
+    const [repoOptions, labels, milestones, assignees, projects, templates] = await Promise.all([
       github.getRepos(),
       github.getLabels(selectedRepo),
       github.getMilestones(selectedRepo),
+      github.getAssignees(selectedRepo),
       github.getProjects(),
       github.getIssueTemplates(selectedRepo),
     ]);
@@ -798,6 +835,9 @@ export function registerHandlers(app, github) {
     const initialLabelValues = defaults.labelValues.filter((labelValue) =>
       labels.some((label) => label.value === labelValue)
     );
+    const initialAssigneeValues = (defaults.assigneeLogins ?? []).filter((login) =>
+      assignees.some((assignee) => assignee.value === login)
+    );
 
     await client.views.update({
       view_id: modalView.id,
@@ -809,12 +849,14 @@ export function registerHandlers(app, github) {
         currentBody,
         labels,
         milestones,
+        assignees,
         projects,
         templates,
         projectFields,
         initialProjectId,
         initialMilestoneValue,
         initialLabelValues,
+        initialAssigneeValues,
         initialProjectFieldValues: currentProjectFieldValues,
         repoOptions,
       }),
@@ -835,10 +877,13 @@ export function registerHandlers(app, github) {
     const currentProjectId = modalView.state.values.project_block?.project_select?.selected_option?.value ?? null;
     const currentProjectFieldValues = collectModalProjectFieldValues(modalView.state.values);
 
-    const [repoOptions, labels, milestones, projects, templates, projectFields] = await Promise.all([
+    const currentAssigneeValues = modalView.state.values.assignees_block?.assignees_select?.selected_options?.map((o) => o.value) ?? null;
+
+    const [repoOptions, labels, milestones, assignees, projects, templates, projectFields] = await Promise.all([
       github.getRepos(),
       github.getLabels(selectedRepo),
       github.getMilestones(selectedRepo),
+      github.getAssignees(selectedRepo),
       github.getProjects(),
       github.getIssueTemplates(selectedRepo),
       currentProjectId ? github.getProjectFields(currentProjectId).catch(() => []) : Promise.resolve([]),
@@ -859,6 +904,9 @@ export function registerHandlers(app, github) {
       ? templateLabelValues
       : defaults.labelValues.filter((lv) => labels.some((l) => l.value === lv));
 
+    const initialAssigneeValues = (currentAssigneeValues ?? defaults.assigneeLogins ?? [])
+      .filter((login) => assignees.some((a) => a.value === login));
+
     await client.views.update({
       view_id: modalView.id,
       hash: modalView.hash,
@@ -869,6 +917,7 @@ export function registerHandlers(app, github) {
         currentBody: selectedTemplate?.body ?? modalView.state.values.body_block?.body_input?.value ?? "",
         labels,
         milestones,
+        assignees,
         projects,
         templates,
         projectFields,
@@ -876,6 +925,7 @@ export function registerHandlers(app, github) {
         initialProjectId: resolvedProjectId,
         initialMilestoneValue,
         initialLabelValues,
+        initialAssigneeValues,
         initialProjectFieldValues: currentProjectFieldValues,
         repoOptions,
       }),
@@ -897,12 +947,14 @@ export function registerHandlers(app, github) {
     const currentBody = modalView.state.values.body_block?.body_input?.value ?? "";
     const currentLabelValues = modalView.state.values.labels_block?.labels_select?.selected_options?.map((o) => o.value) ?? [];
     const currentMilestoneValue = modalView.state.values.milestone_block?.milestone_select?.selected_option?.value ?? null;
+    const currentAssigneeValues = modalView.state.values.assignees_block?.assignees_select?.selected_options?.map((o) => o.value) ?? [];
     const currentProjectFieldValues = collectModalProjectFieldValues(modalView.state.values);
 
-    const [repoOptions, labels, milestones, projects, templates, projectFields] = await Promise.all([
+    const [repoOptions, labels, milestones, assignees, projects, templates, projectFields] = await Promise.all([
       github.getRepos(),
       github.getLabels(selectedRepo),
       github.getMilestones(selectedRepo),
+      github.getAssignees(selectedRepo),
       github.getProjects(),
       github.getIssueTemplates(selectedRepo),
       selectedProjectId ? github.getProjectFields(selectedProjectId).catch(() => []) : Promise.resolve([]),
@@ -918,6 +970,7 @@ export function registerHandlers(app, github) {
         currentBody,
         labels,
         milestones,
+        assignees,
         projects,
         templates,
         projectFields,
@@ -925,6 +978,7 @@ export function registerHandlers(app, github) {
         initialProjectId: selectedProjectId,
         initialMilestoneValue: currentMilestoneValue,
         initialLabelValues: currentLabelValues,
+        initialAssigneeValues: currentAssigneeValues,
         initialProjectFieldValues: currentProjectFieldValues,
         repoOptions,
       }),
@@ -973,6 +1027,7 @@ export function registerHandlers(app, github) {
     const selectedRepo = formValues.repo_block?.repo_select?.selected_option?.value ?? "";
     const issueTitle = formValues.title_block?.title_input?.value ?? "";
     const selectedLabels = formValues.labels_block?.labels_select?.selected_options?.map((opt) => opt.value) ?? [];
+    const selectedAssignees = formValues.assignees_block?.assignees_select?.selected_options?.map((opt) => opt.value) ?? [];
     const milestoneValue = formValues.milestone_block?.milestone_select?.selected_option?.value ?? null;
     const selectedProjectId = formValues.project_block?.project_select?.selected_option?.value ?? null;
     const parentIssueInput = formValues.parent_issue_block?.parent_issue_input?.value?.trim() ?? null;
@@ -985,6 +1040,7 @@ export function registerHandlers(app, github) {
       projectId: selectedProjectId,
       milestoneValue,
       labelValues: selectedLabels,
+      assigneeLogins: selectedAssignees,
     });
 
     await ack();
@@ -1018,6 +1074,7 @@ export function registerHandlers(app, github) {
         body: issueBody,
         labels: selectedLabels,
         milestone: milestoneValue ? Number(milestoneValue) : undefined,
+        assignees: selectedAssignees,
       });
 
       if (selectedProjectId) {
@@ -1167,6 +1224,11 @@ export function registerHandlers(app, github) {
       ?? cardMeta.defaultMilestoneValue
       ?? null;
 
+    const selectedAssigneeLogins =
+      stateValues[CARD_ASSIGNEES_BLOCK_ID]?.[CARD_ASSIGNEES_ACTION_ID]?.selected_options?.map((option) => option.value)
+      ?? cardMeta.defaultAssigneeLogins
+      ?? [];
+
     // Re-fetch the full thread live instead of trusting cardMeta.messageText:
     // fitCardMeta may have truncated or dropped that field to keep the button
     // value under Slack's 2000-char limit, which would leave the issue body
@@ -1226,6 +1288,7 @@ export function registerHandlers(app, github) {
           selectedMilestoneValue && selectedMilestoneValue !== "" && selectedMilestoneValue !== CARD_MILESTONE_NONE_VALUE
             ? Number(selectedMilestoneValue)
             : undefined,
+        assignees: selectedAssigneeLogins,
       });
 
       // Native issue type is set via updateIssue (independent of any project).
@@ -1301,6 +1364,11 @@ export function registerHandlers(app, github) {
       ?? cardMeta.defaultMilestoneValue
       ?? null;
 
+    const currentAssigneeValues =
+      stateValues[CARD_ASSIGNEES_BLOCK_ID]?.[CARD_ASSIGNEES_ACTION_ID]?.selected_options?.map((option) => option.value)
+      ?? cardMeta.defaultAssigneeLogins
+      ?? [];
+
     // Re-fetch the seed to fill the modal with the full body, since fitCardMeta
     // may have truncated cardMeta.messageText to fit the card button value.
     const liveSeedPromise = cardMeta.seedTs && cardMeta.channelId && cardMeta.threadTs
@@ -1309,10 +1377,11 @@ export function registerHandlers(app, github) {
           .catch(() => null)
       : Promise.resolve(null);
 
-    const [repoOptions, labels, milestones, projects, projectFields, liveSeed] = await Promise.all([
+    const [repoOptions, labels, milestones, assignees, projects, projectFields, liveSeed] = await Promise.all([
       github.getRepos(),
       github.getLabels(cardMeta.repo),
       github.getMilestones(cardMeta.repo),
+      github.getAssignees(cardMeta.repo),
       github.getProjects(),
       cardMeta.projectId ? github.getProjectFields(cardMeta.projectId).catch(() => []) : Promise.resolve([]),
       liveSeedPromise,
@@ -1360,11 +1429,13 @@ export function registerHandlers(app, github) {
         currentBody: liveBodyFromSeed ?? cardMeta.messageText,
         labels,
         milestones,
+        assignees,
         projects,
         projectFields,
         initialProjectId: cardMeta.projectId,
         initialLabelValues: currentLabelValues,
         initialMilestoneValue: currentMilestoneValue,
+        initialAssigneeValues: currentAssigneeValues,
         initialProjectFieldValues,
         repoOptions,
       }),

@@ -35,11 +35,13 @@ export function buildModal({
   currentBody = "",
   labels = [],
   milestones = [],
+  assignees = [],
   projects = [],
   templates = [],
   projectFields = [],
   initialLabelValues = [],
   initialMilestoneValue = null,
+  initialAssigneeValues = [],
   initialProjectId = null,
   initialTemplateId = null,
   initialProjectFieldValues = {},
@@ -145,6 +147,25 @@ export function buildModal({
         placeholder: { type: "plain_text", text: "Select labels…" },
         options: labels.map((label) => toSlackOption(label.text, label.value)),
         ...(preSelectedLabels.length > 0 ? { initial_options: preSelectedLabels } : {}),
+      },
+    });
+  }
+
+  if (assignees.length > 0) {
+    const preSelectedAssignees = assignees
+      .filter((assignee) => initialAssigneeValues.includes(assignee.value))
+      .map((assignee) => toSlackOption(assignee.text, assignee.value));
+    blocks.push({
+      type: "input",
+      block_id: "assignees_block",
+      optional: true,
+      label: { type: "plain_text", text: "Assignees" },
+      element: {
+        type: "multi_static_select",
+        action_id: "assignees_select",
+        placeholder: { type: "plain_text", text: "Select assignees…" },
+        options: assignees.map((assignee) => toSlackOption(assignee.text, assignee.value)),
+        ...(preSelectedAssignees.length > 0 ? { initial_options: preSelectedAssignees } : {}),
       },
     });
   }

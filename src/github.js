@@ -84,6 +84,21 @@ async function getRepos() {
   return names;
 }
 
+  // Returns true if the repo is accessible to the current token, false on 404.
+  // On other errors (rate limit, network), returns true to avoid blocking
+  // legitimate use when GitHub is flaky — the subsequent API call will fail
+  // and surface a real error.
+  async function repoExists(repoName) {
+    try {
+      await octokit.rest.repos.get({ owner: githubOwner, repo: repoName });
+      return true;
+    } catch (err) {
+      if (err.status === 404) return false;
+      console.warn(`[repoExists] ${repoName} check failed: ${err.message}`);
+      return true;
+    }
+  }
+
   async function getLabels(repoName) {
     const labels = await octokit.paginate(octokit.rest.issues.listLabelsForRepo, {
       owner: githubOwner,
@@ -104,6 +119,15 @@ async function getRepos() {
       text: milestone.title,
       value: String(milestone.number),
     }));
+  }
+
+  async function getAssignees(repoName) {
+    const users = await octokit.paginate(octokit.rest.issues.listAssignees, {
+      owner: githubOwner,
+      repo: repoName,
+      per_page: 100,
+    }).catch(() => []);
+    return users.map((user) => ({ text: user.login, value: user.login }));
   }
 
   async function getProjects() {
@@ -197,7 +221,7 @@ async function getRepos() {
     return templates.filter(Boolean);
   }
 
-  async function createIssue({ repo, title, body, labels, milestone }) {
+  async function createIssue({ repo, title, body, labels, milestone, assignees }) {
     const { data } = await octokit.rest.issues.create({
       owner: githubOwner,
       repo,
@@ -205,6 +229,7 @@ async function getRepos() {
       body,
       labels: labels?.length > 0 ? labels : undefined,
       milestone,
+      assignees: assignees?.length > 0 ? assignees : undefined,
     });
     return data;
   }
@@ -347,8 +372,10 @@ async function getRepos() {
 
   return {
     getRepos,
+    repoExists,
     getLabels,
     getMilestones,
+    getAssignees,
     getProjects,
     getProjectFields,
     getIssueTemplates,
