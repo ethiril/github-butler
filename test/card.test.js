@@ -264,6 +264,35 @@ describe("buildIssueCard", () => {
     assert.equal(labelsBlock.initial_options[0].value, "bug");
   });
 
+  test("omits assignees block when assignees array is empty", () => {
+    const blocks = buildIssueCard(minimalArgs);
+    assert.ok(!blocks.some((block) => block.block_id === "card_assignees"));
+  });
+
+  test("includes assignees multi-select in card_assignees block when assignees provided", () => {
+    const assignees = [{ text: "alice", value: "alice" }, { text: "bob", value: "bob" }];
+    const blocks = buildIssueCard({ ...minimalArgs, assignees });
+    const block = blocks.find((b) => b.block_id === "card_assignees");
+    assert.ok(block);
+    assert.equal(block.accessory.type, "multi_static_select");
+    assert.equal(block.accessory.action_id, "card_assignees_select");
+  });
+
+  test("pre-selects default assignees", () => {
+    const assignees = [{ text: "alice", value: "alice" }, { text: "bob", value: "bob" }];
+    const blocks = buildIssueCard({ ...minimalArgs, assignees, defaultAssigneeLogins: ["alice"] });
+    const accessory = blocks.find((b) => b.block_id === "card_assignees").accessory;
+    assert.equal(accessory.initial_options.length, 1);
+    assert.equal(accessory.initial_options[0].value, "alice");
+  });
+
+  test("caps assignees options at 100", () => {
+    const assignees = Array.from({ length: 120 }, (_, i) => ({ text: `u${i}`, value: `u${i}` }));
+    const blocks = buildIssueCard({ ...minimalArgs, assignees });
+    const accessory = blocks.find((b) => b.block_id === "card_assignees").accessory;
+    assert.equal(accessory.options.length, 100);
+  });
+
   test("includes milestone dropdown in card_milestone block when milestones provided", () => {
     const milestones = [{ text: "v1.0", value: "1" }];
     const blocks = buildIssueCard({ ...minimalArgs, milestones });
@@ -406,6 +435,13 @@ describe("buildCardMeta", () => {
     });
     assert.deepEqual(meta.defaultLabelValues, ["bug"]);
     assert.equal(meta.defaultMilestoneValue, "3");
+  });
+
+  test("defaultAssigneeLogins is included and defaults to empty array", () => {
+    const meta = buildCardMeta({ ...baseArgs, defaultAssigneeLogins: ["alice", "bob"] });
+    assert.deepEqual(meta.defaultAssigneeLogins, ["alice", "bob"]);
+    const empty = buildCardMeta(baseArgs);
+    assert.deepEqual(empty.defaultAssigneeLogins, []);
   });
 });
 

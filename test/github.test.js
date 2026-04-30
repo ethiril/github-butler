@@ -126,6 +126,54 @@ describe("createGitHubHelpers", () => {
     }
   });
 
+  test("repoExists returns true when the API call succeeds", async () => {
+    const mockOctokit = {
+      rest: {
+        repos: {
+          get: async (params) => {
+            assert.equal(params.owner, "test-owner");
+            assert.equal(params.repo, "my-repo");
+            return { data: {} };
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    assert.equal(await github.repoExists("my-repo"), true);
+  });
+
+  test("repoExists returns false on 404", async () => {
+    const mockOctokit = {
+      rest: {
+        repos: {
+          get: async () => {
+            const err = new Error("Not Found");
+            err.status = 404;
+            throw err;
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    assert.equal(await github.repoExists("missing-repo"), false);
+  });
+
+  test("repoExists returns true on non-404 errors to avoid blocking on flaky API", async () => {
+    const mockOctokit = {
+      rest: {
+        repos: {
+          get: async () => {
+            const err = new Error("rate limited");
+            err.status = 403;
+            throw err;
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    assert.equal(await github.repoExists("my-repo"), true);
+  });
+
   test("getLabels maps API response to {text, value} pairs", async () => {
     const mockOctokit = {
       paginate: async (fn, params) => {
@@ -167,6 +215,66 @@ describe("createGitHubHelpers", () => {
       { text: "v1.0", value: "1" },
       { text: "v2.0", value: "2" },
     ]);
+  });
+
+  test("getAssignees maps API response to {text, value} pairs of logins", async () => {
+    const mockOctokit = {
+      paginate: async (fn, params) => {
+        assert.equal(params.owner, "test-owner");
+        assert.equal(params.repo, "my-repo");
+        return [{ login: "alice" }, { login: "bob" }];
+      },
+      rest: { issues: { listAssignees: {} } },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    const assignees = await github.getAssignees("my-repo");
+    assert.deepEqual(assignees, [
+      { text: "alice", value: "alice" },
+      { text: "bob", value: "bob" },
+    ]);
+  });
+
+  test("getAssignees returns [] when API throws", async () => {
+    const mockOctokit = {
+      paginate: async () => { throw new Error("API error"); },
+      rest: { issues: { listAssignees: {} } },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    assert.deepEqual(await github.getAssignees("my-repo"), []);
+  });
+
+  test("createIssue passes assignees to the API when non-empty", async () => {
+    let capturedParams;
+    const mockOctokit = {
+      rest: {
+        issues: {
+          create: async (params) => {
+            capturedParams = params;
+            return { data: { number: 1 } };
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    await github.createIssue({ repo: "r", title: "t", body: "b", assignees: ["alice", "bob"] });
+    assert.deepEqual(capturedParams.assignees, ["alice", "bob"]);
+  });
+
+  test("createIssue omits assignees when array is empty", async () => {
+    let capturedParams;
+    const mockOctokit = {
+      rest: {
+        issues: {
+          create: async (params) => {
+            capturedParams = params;
+            return { data: { number: 1 } };
+          },
+        },
+      },
+    };
+    const github = createGitHubHelpers(mockOctokit, "test-owner");
+    await github.createIssue({ repo: "r", title: "t", body: "b", assignees: [] });
+    assert.equal(capturedParams.assignees, undefined);
   });
 
   test("getProjectFields filters out built-in field types", async () => {

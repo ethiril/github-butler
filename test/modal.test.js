@@ -129,6 +129,40 @@ describe("buildModal", () => {
     assert.equal(labelsBlock.element.initial_options[0].value, "bug");
   });
 
+  test("omits assignees block when assignees array is empty", () => {
+    const modal = buildModal({ metadata: {}, selectedRepo: "repo" });
+    assert.ok(!modal.blocks.some((b) => b.block_id === "assignees_block"));
+  });
+
+  test("includes assignees block with initial_options when assignees are provided", () => {
+    const assignees = [{ text: "alice", value: "alice" }, { text: "bob", value: "bob" }];
+    const modal = buildModal({ metadata: {}, selectedRepo: "repo", assignees, initialAssigneeValues: ["bob"] });
+    const block = modal.blocks.find((b) => b.block_id === "assignees_block");
+    assert.ok(block);
+    assert.equal(block.optional, true);
+    assert.equal(block.element.type, "multi_static_select");
+    assert.equal(block.element.action_id, "assignees_select");
+    assert.equal(block.element.initial_options.length, 1);
+    assert.equal(block.element.initial_options[0].value, "bob");
+  });
+
+  test("assignees block omits initial_options when no defaults match available assignees", () => {
+    const assignees = [{ text: "alice", value: "alice" }];
+    const modal = buildModal({ metadata: {}, selectedRepo: "repo", assignees, initialAssigneeValues: ["someone-else"] });
+    const block = modal.blocks.find((b) => b.block_id === "assignees_block");
+    assert.ok(!("initial_options" in block.element));
+  });
+
+  test("assignees block sits between labels and milestone blocks", () => {
+    const labels = [{ text: "bug", value: "bug" }];
+    const assignees = [{ text: "alice", value: "alice" }];
+    const milestones = [{ text: "v1", value: "1" }];
+    const modal = buildModal({ metadata: {}, selectedRepo: "repo", labels, assignees, milestones });
+    const ids = modal.blocks.map((b) => b.block_id);
+    assert.ok(ids.indexOf("labels_block") < ids.indexOf("assignees_block"));
+    assert.ok(ids.indexOf("assignees_block") < ids.indexOf("milestone_block"));
+  });
+
   test("project block is mandatory (no optional property)", () => {
     const projects = [{ text: "My Project", value: "pid" }];
     const modal = buildModal({ metadata: {}, selectedRepo: "repo", projects });

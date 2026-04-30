@@ -11,6 +11,7 @@ test("getUserDefaults returns nulled-out defaults for an unknown user", () => {
     projectId: null,
     milestoneValue: null,
     labelValues: [],
+    assigneeLogins: [],
   });
 });
 

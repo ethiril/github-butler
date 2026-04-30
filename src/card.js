@@ -47,6 +47,8 @@ export const CARD_LABELS_ACTION_ID = "card_labels_select";
 export const CARD_MILESTONE_BLOCK_ID = "card_milestone";
 export const CARD_MILESTONE_ACTION_ID = "card_milestone_select";
 export const CARD_MILESTONE_NONE_VALUE = "__none__";
+export const CARD_ASSIGNEES_BLOCK_ID = "card_assignees";
+export const CARD_ASSIGNEES_ACTION_ID = "card_assignees_select";
 
 function takeOptions(items, limit = MAX_SELECT_OPTIONS) {
   return Array.isArray(items) ? items.slice(0, limit) : [];
@@ -117,10 +119,22 @@ function fitCardMeta(cardMeta) {
   if (Array.isArray(cardMeta?.defaultLabelValues)) {
     fitted.defaultLabelValues = [...cardMeta.defaultLabelValues];
   }
+  if (Array.isArray(cardMeta?.defaultAssigneeLogins)) {
+    fitted.defaultAssigneeLogins = [...cardMeta.defaultAssigneeLogins];
+  }
 
   let serializedLength = JSON.stringify(fitted).length;
   const isOverLimit = () => serializedLength > MAX_BUTTON_VALUE_CHARS;
   const remeasure = () => { serializedLength = JSON.stringify(fitted).length; };
+
+  while (
+    isOverLimit() &&
+    Array.isArray(fitted.defaultAssigneeLogins) &&
+    fitted.defaultAssigneeLogins.length > 0
+  ) {
+    fitted.defaultAssigneeLogins.pop();
+    remeasure();
+  }
 
   while (
     isOverLimit() &&
@@ -179,13 +193,16 @@ export function buildIssueCard({
   title,
   labels = [],
   milestones = [],
+  assignees = [],
   cardFields = [],
   defaultLabelValues = [],
   defaultMilestoneValue = null,
+  defaultAssigneeLogins = [],
   cardMeta,
 }) {
   const cappedLabels = takeOptions(labels);
   const cappedMilestones = takeOptions(milestones, MAX_SELECT_OPTIONS - 1);
+  const cappedAssignees = takeOptions(assignees);
   const fittedCardMeta = fitCardMeta(cardMeta);
 
   const blocks = [
@@ -227,6 +244,27 @@ export function buildIssueCard({
         options: cappedLabels.map((label) => toSlackOption(label.text, label.value)),
         ...(preSelectedLabels.length > 0
           ? { initial_options: preSelectedLabels.map((label) => toSlackOption(label.text, label.value)) }
+          : {}),
+      },
+    });
+  }
+
+  if (cappedAssignees.length > 0) {
+    const preSelectedAssignees = cappedAssignees.filter((assignee) =>
+      defaultAssigneeLogins.includes(assignee.value)
+    );
+
+    blocks.push({
+      type: "section",
+      block_id: CARD_ASSIGNEES_BLOCK_ID,
+      text: { type: "mrkdwn", text: "*Assignees*" },
+      accessory: {
+        type: "multi_static_select",
+        action_id: CARD_ASSIGNEES_ACTION_ID,
+        placeholder: { type: "plain_text", text: "Assignees" },
+        options: cappedAssignees.map((assignee) => toSlackOption(assignee.text, assignee.value)),
+        ...(preSelectedAssignees.length > 0
+          ? { initial_options: preSelectedAssignees.map((assignee) => toSlackOption(assignee.text, assignee.value)) }
           : {}),
       },
     });
@@ -306,6 +344,7 @@ export function buildCardMeta({
   cardFields = [],
   defaultLabelValues = [],
   defaultMilestoneValue = null,
+  defaultAssigneeLogins = [],
   parentIncluded = false,
   seedTs = null,
 }) {
@@ -326,6 +365,7 @@ export function buildCardMeta({
     })),
     defaultLabelValues,
     defaultMilestoneValue,
+    defaultAssigneeLogins,
     parentIncluded,
     seedTs,
   };
